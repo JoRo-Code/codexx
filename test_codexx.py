@@ -68,12 +68,11 @@ class CodexxTests(unittest.TestCase):
         self.launch(['accounts', 'desktop', 'setup', '--terminal'])
         self.assertEqual(self.execv.call_args.args[1][-2:], ['setup', '--terminal'])
 
-    def test_cli_setup_does_not_start_desktop_or_modify_accounts(self):
-        before = {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
-        with contextlib.redirect_stdout(io.StringIO()) as output:
-            cx.main(['accounts', 'setup'])
-        self.assertIn('a, b', output.getvalue())
-        self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+    def test_setup_delegates_to_existing_web_setup(self):
+        for options in ([], ['--terminal'], ['--account', 'a']):
+            self.launch(['accounts', 'setup', *options])
+            self.assertEqual(self.execv.call_args.args[1],
+                             [sys.executable, self.app.__file__, 'setup', *options])
         self.address.assert_not_called()
 
     def test_native_tools_and_explicit_transport_pass_through(self):

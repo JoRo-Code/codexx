@@ -15,7 +15,7 @@ import codexx_updates
 source = Path(__file__).resolve().with_name('codex-accounts')
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--bin-dir', type=Path, default=Path.home() / '.local/bin', help='Installation directory (default: ~/.local/bin)')
-parser.add_argument('--setup', action='store_true', help='Run CLI account setup after installation')
+parser.add_argument('--setup', action='store_true', help='Open the account management web app after installation')
 parser.add_argument('--codexx-only', action='store_true', help='Add codexx alongside an existing installation without replacing codex-accounts')
 args = parser.parse_args()
 bin_dir = args.bin_dir.expanduser().resolve()

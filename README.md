@@ -32,12 +32,12 @@ reattached to the shared router. Close such a terminal before resuming its chat.
 Administration is under a separate namespace:
 
 ```sh
-codexx accounts setup                  # CLI setup; reuses existing accounts
+codexx accounts setup                  # Open the account management web app
 codexx accounts add work
 codexx accounts status
 codexx accounts overview --history
 codexx accounts routing --threshold 95
-codexx accounts desktop setup          # Optional Desktop onboarding
+codexx accounts add work               # Add an account directly from the CLI
 codexx accounts update                # Also updates the bundle after migration
 ```
 
@@ -147,7 +147,7 @@ codex-accounts desktop stop         # Stop managed services and active router wo
 codex-accounts desktop start        # Start services again
 ```
 
-For CLI installation and account setup, use `python3 install.py --setup`; then use `codexx accounts desktop setup` if you also want Desktop. Use `setup --account LABEL` to select the initial account explicitly or `--port NUMBER` for a fixed localhost port. To change an existing setup's account or port, stop its services first, then rerun setup with the desired option. `desktop restart` loads updated router code and interrupts active router work; do it between turns. Updates and reinstalls preserve credentials and configuration. After a reboot, log in to start the services, then let Desktop reconnect.
+To install and open the account management web app, use `python3 install.py --setup`. You can also open it later with `codexx accounts setup`; connecting Desktop is optional. Use `setup --account LABEL` to select the initial account explicitly or `--port NUMBER` for a fixed localhost port. To change an existing setup's account or port, stop its services first, then rerun setup with the desired option. `desktop restart` loads updated router code and interrupts active router work; do it between turns. Updates and reinstalls preserve credentials and configuration. After a reboot, log in to start the services, then let Desktop reconnect.
 
 Generated configuration, keys, logs, and settings live under `~/.local/share/codex-accounts/desktop`. Setup adds one Include line to `~/.ssh/config` and retains a backup before its first change. It does not replace existing SSH hosts or native Codex daemons. Only macOS onboarding is packaged today; Linux CLI and manual router usage remain available.
 

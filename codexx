@@ -136,21 +136,6 @@ def router_address(app):
         raise app.Error('Router did not become ready. See ' + str(log))
 
 
-def setup_cli(app):
-    connected = [name for name in app.accounts() if (app.account_home(name) / 'auth.json').is_file()]
-    if not connected:
-        if not sys.stdin.isatty():
-            raise app.Error('Connect an account with codexx accounts add NAME.')
-        name = input('Name for your first ChatGPT account [personal]: ').strip() or 'personal'
-        app.login(name, create=name not in app.accounts())
-        connected = [name]
-    print('Connected accounts: ' + ', '.join(connected))
-    print('Using existing data: ' + str(app.ROOT))
-    print('Run codexx to start, or codexx resume to continue a chat.')
-    print('Add another account: codexx accounts add NAME')
-    print('Desktop is optional: codexx accounts desktop setup')
-
-
 class ChatFilter:
     """The shared Desktop router broadcasts notifications; a TUI needs its own chats."""
     def __init__(self):
@@ -312,8 +297,6 @@ def main(args=None):
         os.execv(binary, [binary, *args[1:]])
     if args[:1] == ['accounts']:
         tail = args[1:]
-        if tail == ['setup']:
-            return setup_cli(app)
         if tail[:2] == ['desktop', 'setup']:
             tail = ['setup', *tail[2:]]
         os.execv(sys.executable, [sys.executable, app.__file__, *(tail or ['--help'])])
@@ -330,9 +313,8 @@ def main(args=None):
         result = subprocess.run([binary, *args])
         if command in (None, 'help'):
             print('\ncodexx: automatic account routing for interactive chats and resume/fork.')
-            print('  codexx accounts setup          CLI account setup (no Desktop required)')
+            print('  codexx accounts setup          Open account management in your browser')
             print('  codexx accounts --help         Account administration')
-            print('  codexx accounts desktop setup Optional Desktop connection')
             print('  codexx update                 Update the complete Codexx bundle')
             print('  codexx update all sessions    Request safe adoption; never restart chats')
             print('  codexx update status          Show current/pending/legacy sessions')
