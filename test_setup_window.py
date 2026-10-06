@@ -1,5 +1,7 @@
 import http.client
 import json
+import concurrent.futures
+import os
 import threading
 import unittest
 from unittest.mock import patch
@@ -25,6 +27,48 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.request(s,headers=dict(auth,Host='evil.example'))[0],403)
         self.assertEqual(self.request(s,headers=dict(auth,Origin='https://evil.example'))[0],403)
         self.assertEqual(self.request(s,method='POST',path='/api/action',body='{"action":"connect"}')[0],403)
+    def test_repeated_and_simultaneous_opens_reuse_one_server(self):
+        server=self.server()
+        record={'port':server.server_port,'token':self.window.token}
+        def launch(*args,**kwargs):
+            app.atomic_json(app.setup_server_record(),record)
+            return unittest.mock.Mock()
+        with patch.object(app.sys,'platform','darwin'), patch.object(app.subprocess,'Popen',side_effect=launch) as launch_process, patch('webbrowser.open',return_value=True) as browser:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                results=list(executor.map(lambda _:app.open_setup_window(),range(4)))
+            self.assertEqual(results,[0]*4)
+            self.assertEqual(launch_process.call_count,1)
+            self.assertEqual(browser.call_count,4)
+            self.assertEqual(len({call.args[0] for call in browser.call_args_list}),1)
+        self.assertEqual(os.stat(app.setup_server_record()).st_mode & 0o777,0o600)
+
+    def test_stale_or_invalid_server_record_is_not_reused(self):
+        app.atomic_json(app.setup_server_record(),{'port':0,'token':'bad'})
+        self.assertIsNone(app.existing_setup_server())
+        server=self.server()
+        app.atomic_json(app.setup_server_record(),{'port':server.server_port,'token':'wrong'})
+        self.assertIsNone(app.existing_setup_server())
+        app.setup_server_record().write_text('not json')
+        self.assertIsNone(app.existing_setup_server())
+
+    def test_options_are_authenticated_and_shared_without_interrupting_jobs(self):
+        server=self.server();auth={'Authorization':'Bearer '+self.window.token}
+        self.assertEqual(self.request(server,'/api/health')[0],403)
+        self.assertEqual(self.request(server,'/api/open','POST',body='{}')[0],403)
+        code,_=self.request(server,'/api/open','POST',auth,json.dumps({'account':'work','port':22284}))
+        self.assertEqual(code,200);self.assertEqual((self.window.account,self.window.port),('work',22284))
+        self.window.job=dict(busy=True,error=False,message='Signing in from another tab')
+        code,_=self.request(server,'/api/open','POST',auth,'{}')
+        self.assertEqual(code,200)
+        code,_=self.request(server,'/api/open','POST',auth,json.dumps({'account':'personal'}))
+        self.assertEqual(code,409);self.assertEqual(self.window.account,'work')
+        self.assertEqual(self.request(server,'/api/open','POST',auth,'{"port":true}')[0],400)
+        with patch.object(self.window,'work') as work:
+            self.request(server,'/api/action','POST',auth,'{"action":"add","label":"extra"}')
+            work.assert_not_called()
+        _,body=self.request(server,headers=auth)
+        self.assertEqual(json.loads(body)['job']['message'],'Signing in from another tab')
+
     def test_only_known_actions_and_valid_labels(self):
         s=self.server();auth={'Authorization':'Bearer '+self.window.token}
         for data in ({'action':'shell'},{'action':'add','label':'../escape'},['connect']):

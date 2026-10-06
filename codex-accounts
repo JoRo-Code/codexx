@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.13.1'
+VERSION = '0.13.2'
 # Bump only when live object state/protocol can no longer be adopted in place.
 LIVE_RUNTIME_ABI = 1
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
@@ -2959,7 +2959,7 @@ SETUP_HTML = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name
 <li><h3>Prepare the local connection</h3><p>In the Desktop connection card below, click <strong>Connect</strong> and wait for it to be ready. This keeps existing accounts and running services.</p><p class="guide-status" id="guide-connection-status">Checking local connection…</p><button type="button" class="secondary" id="guide-show-connection">Go to Desktop connection</button></li>
 <li><h3>Link the connection in Desktop</h3><p>Open <strong>Settings → Connections → SSH → Add</strong>. Use this hostname, leaving port and identity blank:</p><div class="command"><code id="guide-hostname">codex-auto</code><button type="button" class="secondary" data-copy="guide-hostname">Copy</button></div><p>If the connection is already listed, select it. Add a project folder on that connection and start a new chat there.</p><p>Local readiness does not confirm that Desktop is linked. Existing chats stay on their current connection. Check the activity below after starting your new chat.</p></li>
 </ol></div>
-<details class="guide-help"><summary>Install or reinstall Codexx</summary><p>You need Git, Python 3.9+ and the official Codex CLI on PATH. CLI works on macOS and Linux; this web app and managed Desktop connection require macOS.</p><div class="command"><code id="guide-install-command">git clone --branch v0.13.1 --depth 1 https://github.com/JoRo-Code/codexx.git
+<details class="guide-help"><summary>Install or reinstall Codexx</summary><p>You need Git, Python 3.9+ and the official Codex CLI on PATH. CLI works on macOS and Linux; this web app and managed Desktop connection require macOS.</p><div class="command"><code id="guide-install-command">git clone --branch v0.13.2 --depth 1 https://github.com/JoRo-Code/codexx.git
 cd codexx
 python3 install.py
 export PATH="$HOME/.local/bin:$PATH"</code><button type="button" class="secondary" data-copy="guide-install-command">Copy</button></div><p>Then run <code>codexx accounts setup</code> on macOS, or <code>codexx accounts add personal</code> on Linux. <a href="https://github.com/JoRo-Code/codexx#install" target="_blank" rel="noreferrer">Full prerequisites and installation instructions</a>.</p></details>
@@ -2972,7 +2972,7 @@ export PATH="$HOME/.local/bin:$PATH"</code><button type="button" class="secondar
 <section class="card" id="desktop-connection" tabindex="-1"><div class="row"><h2>Desktop connection</h2><span id="badge" class="badge">Checking</span></div><p id="explain">We’ll configure and start the local connection for you. It starts automatically when you log in to this Mac.</p><button id="connect" disabled>Connect</button><details id="desktop" hidden><summary>Connection instructions</summary><p>The local connection is ready. Link it in Desktop once:</p><ol><li>Open <strong>Settings → Connections → SSH → Add</strong>.</li><li>Use hostname <code id="alias">codex-auto</code> <button id="copy" class="secondary">Copy</button>. Leave port and identity blank.</li><li>Add a project folder on that connection, then start a chat there.</li></ol><p class="muted">Already linked? You’re ready to use that project. Existing chats stay on their current connection.</p></details></section>
 <footer>Runs privately on this Mac. Account credentials stay on this device.<br>Closing this page leaves your chats and background connection running.</footer></main>
 <script>
-const token=location.hash.slice(1)||sessionStorage.getItem('setup-token')||'';sessionStorage.setItem('setup-token',token);history.replaceState(null,'',location.pathname);let busy=false;
+const token=location.hash.slice(1)||localStorage.getItem('setup-token')||sessionStorage.getItem('setup-token')||'';if(token)localStorage.setItem('setup-token',token);sessionStorage.removeItem('setup-token');history.replaceState(null,'',location.pathname);let busy=false;
 const $=id=>document.getElementById(id);const say=(s,error=false)=>{$('message').textContent=s;$('message').className=error?'error':''};
 async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(r.status===403?'This setup page expired. Run codexx accounts setup to open it again.':'Could not reach setup. Reopen with codexx accounts setup.');return r.json()}
 function render(s){renderGuide(s);busy=s.job.busy;for(const id of ['add','refresh','connect'])$(id).disabled=busy;const box=$('accounts');box.replaceChildren();for(const a of s.accounts){const d=document.createElement('div');d.className='account';const name=document.createElement('strong');name.textContent=a.label+(a.email?' · '+a.email:'');d.append(name);const p=document.createElement('p');p.className='muted';p.textContent=a.detail;d.append(p);box.append(d)}if(!s.accounts.length){const p=document.createElement('p');p.textContent='Connect your first account to get started.';box.append(p)}$('connect').disabled=busy||!s.accounts.some(a=>a.connected);$('connect').hidden=s.ready;$('desktop').hidden=!s.ready;$('alias').textContent=s.alias;$('badge').textContent=s.ready?'Local connection ready':'Not connected';$('explain').hidden=s.ready;$('usage-time').textContent=s.usage_checked_at?'Checked '+new Date(s.usage_checked_at*1000).toLocaleTimeString()+' · refreshes every minute':'';if(s.job.message)say(s.job.message,s.job.error)}
@@ -3134,7 +3134,7 @@ class SetupWindow:
                     reports=collect_status()
                     self.set_reports(reports)
         except (Error,OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as exc:
-            message=str(exc);failed=True
+            message=('Another setup window is working. Wait for it to finish, then retry here.' if str(exc)=='This account or conversation is busy. Close its active launcher session and retry.' else str(exc));failed=True
         finally:
             with self.mutex:self.job=dict(busy=False,error=failed,message=message)
 
@@ -3164,6 +3164,9 @@ def setup_http_server(window):
         def do_GET(self):
             if not self.allowed(auth=self.path!='/'):return self.reply(403,{})
             if self.path=='/':return self.reply(200,SETUP_HTML,True)
+            if self.path=='/api/health':
+                window.last_seen=time.monotonic()
+                return self.reply(200,{'service':'codexx-setup','version':VERSION})
             if self.path=='/api/activity':
                 window.last_seen=time.monotonic()
                 try:return self.reply(200,window.activity())
@@ -3174,12 +3177,23 @@ def setup_http_server(window):
             self.reply(404,{})
         def do_POST(self):
             if not self.allowed():return self.reply(403,{})
-            if self.path!='/api/action':return self.reply(404,{})
+            if self.path not in ('/api/action','/api/open'):return self.reply(404,{})
             try:
                 length=int(self.headers.get('Content-Length','0'))
                 if not 0<length<=1024:raise ValueError()
                 data=json.loads(self.rfile.read(length))
                 if not isinstance(data,dict):raise ValueError()
+                if self.path=='/api/open':
+                    account,port=data.get('account'),data.get('port')
+                    if account is not None and (not isinstance(account,str) or not NAME.fullmatch(account)):raise ValueError()
+                    if port is not None and (type(port) is not int or not 1<=port<=65535):raise ValueError()
+                    with window.mutex:
+                        changes=(account is not None and account!=window.account) or (port is not None and port!=window.port)
+                        if changes and window.job['busy']:return self.reply(409,{'error':'Setup is busy. Wait for the current operation before changing setup options.'})
+                        if account is not None:window.account=account
+                        if port is not None:window.port=port
+                    window.last_seen=time.monotonic()
+                    return self.reply(200,{'ok':True})
                 window.start(data.get('action'),data.get('label',''))
             except (ValueError,TypeError):return self.reply(400,{})
             except Error as exc:
@@ -3190,33 +3204,87 @@ def setup_http_server(window):
     return ThreadingHTTPServer(('127.0.0.1',0),Handler)
 
 
-def serve_setup_window(account=None,port=None):
-    import webbrowser
-    window=SetupWindow(account,port)
-    server=setup_http_server(window);server.timeout=1
-    url='http://127.0.0.1:'+str(server.server_port)+'/#'+window.token
-    window.start('refresh')
-    if not webbrowser.open(url):
-        server.server_close();raise Error('Could not open a browser. Use setup --terminal instead.')
+def setup_server_record():
+    # A new release gets a new UI server; old tabs may finish on their loaded version.
+    return ROOT / 'setup-web' / (VERSION + '.json')
+
+
+def setup_server_request(record, path, body=None):
+    import http.client
+    if not isinstance(record,dict) or type(record.get('port')) is not int or not 1<=record['port']<=65535 or not isinstance(record.get('token'),str):
+        raise ValueError('Invalid setup server record')
+    conn=http.client.HTTPConnection('127.0.0.1',record['port'],timeout=1)
     try:
-        while time.monotonic()-window.last_seen<1800 or window.job['busy']:
-            server.handle_request()
-            if not window.job['busy'] and time.time()-window.last_usage_attempt>=60:
-                window.start('refresh')
-    finally:server.server_close()
+        headers={'Authorization':'Bearer '+record['token'],'Content-Type':'application/json'}
+        conn.request('POST' if body is not None else 'GET',path,json.dumps(body) if body is not None else None,headers)
+        response=conn.getresponse();data=json.loads(response.read(8192))
+        if response.status!=200:raise Error(data.get('error','Setup server could not be reached.'))
+        return data
+    finally:conn.close()
+
+
+def existing_setup_server():
+    import http.client
+    try:
+        record=read_json(setup_server_record())
+        health=setup_server_request(record,'/api/health')
+        if health=={'service':'codexx-setup','version':VERSION}:return record
+    except (Error,OSError,ValueError,http.client.HTTPException):pass
+    return None
+
+
+@contextlib.contextmanager
+def setup_start_lock():
+    private_dir(ROOT/'locks')
+    with (ROOT/'locks'/('setup-start-'+VERSION+'.lock')).open('a') as stream:
+        # Launch is short; simultaneous commands wait and reuse the first server.
+        fcntl.flock(stream,fcntl.LOCK_EX)
+        yield
+
+
+def serve_setup_window(account=None,port=None):
+    with lock('setup-server-'+VERSION):
+        window=SetupWindow(account,port)
+        server=setup_http_server(window);server.timeout=1
+        record={'port':server.server_port,'token':window.token}
+        try:
+            atomic_json(setup_server_record(),record)
+            window.start('refresh')
+            while time.monotonic()-window.last_seen<1800 or window.job['busy']:
+                server.handle_request()
+                if not window.job['busy'] and time.time()-window.last_usage_attempt>=60:
+                    try:window.start('refresh')
+                    except Error:pass  # A browser action may have started after the idle check.
+        finally:
+            server.server_close()
+            if read_json(setup_server_record())==record:setup_server_record().unlink(missing_ok=True)
     return 0
 
 
 def open_setup_window(account=None,port=None):
-    if sys.platform!='darwin':raise Error('Desktop setup currently supports macOS only.')
-    args=[sys.executable,str(executable_path()),'setup-window']
-    if account:args+=['--account',account]
-    if port is not None:args+=['--port',str(port)]
-    # Detach so closing the terminal cannot interrupt login or the setup page.
-    subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                     start_new_session=True,env=dict(os.environ,CODEX_ACCOUNTS_HOME=str(ROOT)))
-    print('Opening Codex Accounts in your browser. Choose Add account or Connect there.')
-    print('If the window does not open: codex-accounts setup --terminal')
+    import webbrowser
+    if sys.platform!='darwin':raise Error('The setup web app currently supports macOS only.')
+    with setup_start_lock():
+        record=existing_setup_server()
+        if record is None:
+            args=[sys.executable,str(executable_path()),'setup-window']
+            if account:args+=['--account',account]
+            if port is not None:args+=['--port',str(port)]
+            # Detached so closing Terminal does not interrupt sign-in or the web app.
+            process=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                                     start_new_session=True,env=dict(os.environ,CODEX_ACCOUNTS_HOME=str(ROOT)))
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline:
+                record=existing_setup_server()
+                if record is not None:break
+                if process.poll() is not None:break
+                time.sleep(.05)
+            if record is None:raise Error('The setup web app did not start. Try codexx accounts setup again.')
+        # Never silently discard explicit options on a reused server.
+        setup_server_request(record,'/api/open',{'account':account,'port':port})
+        url='http://127.0.0.1:'+str(record['port'])+'/#'+record['token']
+        if not webbrowser.open(url,new=2):raise Error('Could not open a browser. Use codexx accounts setup --terminal instead.')
+    print('Opening Codexx in your browser. Multiple tabs share accounts and setup status.')
     return 0
 
 if __name__ == '__main__':
