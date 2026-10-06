@@ -125,7 +125,7 @@ native backends keep their original preserved tool runtime. The existing
 Complete [installation](#install) first. Desktop integration is optional and currently packaged for **macOS only**. The account web app also currently requires macOS; Linux users can add accounts in the CLI.
 
 1. Install and open the desktop app using [OpenAI's desktop installation page](https://learn.chatgpt.com/docs/app), then sign in. Codexx does not install the desktop app for you.
-2. In Terminal, run `codexx accounts setup`. This opens the local account management web app.
+2. In Terminal, run `codexx accounts setup`. This opens the local account management web app. Its **Get started with Codexx** guide has separate CLI and Desktop steps, copyable commands, and live account/connection status.
 3. Choose **Add account** and finish ChatGPT sign-in in your browser. Repeat for additional accounts. If your accounts are already listed, reuse them.
 4. Under **Desktop connection**, click **Connect**. Wait for the local connection to report ready. Existing running services and accounts are retained.
 5. In the desktop app, open **Settings → Connections → SSH → Add**. Use the hostname shown by the web app, normally `codex-auto`. Leave port and identity blank; the generated SSH configuration supplies them. If that connection is already present, select it instead of adding a duplicate.
@@ -213,15 +213,15 @@ See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [
 
 ### 2. Download and install Codexx
 
-For the published v0.13.0 release:
+For the published v0.13.1 release:
 
 ```sh
-git clone --branch v0.13.0 --depth 1 https://github.com/JoRo-Code/codexx.git
+git clone --branch v0.13.1 --depth 1 https://github.com/JoRo-Code/codexx.git
 cd codexx
 python3 install.py
 ```
 
-Alternatively, download `codexx-0.13.0.tar.gz` from [v0.13.0 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.13.0), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
+Alternatively, download `codexx-0.13.1.tar.gz` from [v0.13.1 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.13.1), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
 
 Already using `codex-accounts`? Run the same installer once. It retains accounts, history, settings and running services under `~/.local/share/codex-accounts`. You do not need to sign in again or restart existing chats. The old command remains supported. Already using a versioned Codexx installation? Use `codexx update` instead.
 
@@ -234,7 +234,7 @@ export PATH="$HOME/.local/bin:$PATH"
 codexx --bundle-version
 ```
 
-It should print `0.13.0` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
+It should print `0.13.1` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
 
 ### 4. Connect your accounts
 
