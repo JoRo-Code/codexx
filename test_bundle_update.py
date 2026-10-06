@@ -23,6 +23,9 @@ class BundleTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name).resolve()
         self.app = cx.load_accounts()
+        self.version = self.app.VERSION
+        major, minor, patch_version = map(int, self.version.split("."))
+        self.next_version = f"{major}.{minor}.{patch_version + 1}"
         self.app.ROOT = self.directory / 'data'
         self.bin = self.directory / 'bin'
         self.bin.mkdir()
@@ -36,7 +39,7 @@ class BundleTests(unittest.TestCase):
         source.mkdir(exist_ok=True)
         for name, payload in self.payloads.items():
             if name == 'codex-accounts':
-                payload = payload.replace(b"VERSION = '0.13.0'", b"VERSION = '0.13.1'")
+                payload = payload.replace(("VERSION = " + repr(self.version)).encode(), ("VERSION = " + repr(self.next_version)).encode())
             (source / name).write_bytes(payload)
         return source
 
@@ -50,7 +53,7 @@ class BundleTests(unittest.TestCase):
             flag = '--bundle-version' if name == 'codexx' else '--version'
             result = subprocess.run([sys.executable, str(self.bin / name), flag], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), '0.13.0')
+            self.assertEqual(result.stdout.strip(), self.version)
 
     def test_update_and_rollback_switch_whole_pair_without_touching_data(self):
         self.app.ROOT.mkdir(exist_ok=True)
@@ -62,7 +65,7 @@ class BundleTests(unittest.TestCase):
         current = (self.root / 'current').resolve()
         self.assertNotEqual(current, self.generation)
         self.assertIn(b'wrapper update', (current / 'codexx').read_bytes())
-        self.assertEqual(self.app.installed_version(self.app.executable_path()), '0.13.1')
+        self.assertEqual(self.app.installed_version(self.app.executable_path()), self.next_version)
         self.assertEqual((self.root / 'previous').resolve(), self.generation)
         self.assertTrue(self.update(rollback=True))
         self.assertEqual((self.root / 'current').resolve(), self.generation)
@@ -83,11 +86,11 @@ class BundleTests(unittest.TestCase):
         with patch.dict(os.environ, {'CODEX_ACCOUNTS_NO_UPDATE': '1'}):
             self.update(source=self.next_source())
             runtime.refresh(force=True)
-            self.assertEqual(runtime.module.VERSION, '0.13.1')
+            self.assertEqual(runtime.module.VERSION, self.next_version)
             self.assertEqual(runtime.fingerprint, self.app.read_json(self.root / 'current/bundle.json')['engine'])
             self.update(rollback=True)
             runtime.refresh(force=True)
-            self.assertEqual(runtime.module.VERSION, '0.13.0')
+            self.assertEqual(runtime.module.VERSION, self.version)
 
     def test_interrupted_activation_keeps_previous_current(self):
         source = self.next_source()
@@ -108,16 +111,16 @@ class BundleTests(unittest.TestCase):
         self.assertEqual((self.root / 'current').resolve(), active)
 
     def test_existing_engine_update_command_delegates_to_bundle(self):
-        with patch.object(self.app, 'newest_release', return_value={'tag_name': 'v0.13.1'}), \
+        with patch.object(self.app, 'newest_release', return_value={'tag_name': 'v' + self.next_version}), \
              patch.object(self.app, 'bundle_updates', return_value=updates), \
              patch.object(updates, 'download', return_value={
                  name: (self.next_source() / name).read_bytes() for name in updates.FILES}), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(self.app.self_update())
-        self.assertEqual(self.app.installed_version(self.app.executable_path()), '0.13.1')
+        self.assertEqual(self.app.installed_version(self.app.executable_path()), self.next_version)
 
     def test_check_and_offline_failure_never_change_current(self):
-        with patch.object(self.app, 'newest_release', return_value={'tag_name': 'v0.13.1'}), \
+        with patch.object(self.app, 'newest_release', return_value={'tag_name': 'v' + self.next_version}), \
              patch.object(updates, 'download') as download:
             self.assertFalse(self.update(check=True))
             download.assert_not_called()
@@ -139,7 +142,7 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(self.app.read_json(self.app.ROOT / 'session-updates.json')['generation'], target['engine'])
 
     def test_download_requires_whole_verified_archive(self):
-        version = '0.13.0'
+        version = self.version
         name = 'codexx-' + version + '.tar.gz'
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode='w:gz') as archive:
