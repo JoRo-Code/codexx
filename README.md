@@ -138,7 +138,7 @@ The page shows account usage, searchable chats with their account and observed s
 
 The page also shows setup progress and local connection readiness. It never claims Desktop is linked just because the local services are ready. Codex Desktop still requires its own connection/project selection; there is no supported automatic approval API. Existing chats stay on their current connection.
 
-Setup creates a dedicated localhost SSH key and alias and installs two user LaunchAgents. They start when you log in and restart after a crash. Re-running setup preserves accounts, histories, permissions, keys, and running services. No admin password, macOS Remote Login, external server, or Python packages are needed. Closing the page does not stop your chats. Its local web server exits after 30 minutes without page activity.
+Setup creates a dedicated localhost SSH key and alias and installs two user LaunchAgents. They start when you log in and restart after a crash. Re-running setup preserves accounts, histories, permissions, keys, and running services. No admin password, macOS Remote Login, external server, or Python packages are needed. Closing the page does not stop your chats. Repeated `codexx accounts setup` commands reuse one local web server per installed version. Tabs in the same browser profile share access and setup status, including when you copy the page address to another tab. Account actions run one at a time; keep ongoing chats open. The local web server exits after 30 minutes without page activity. A newly installed version opens its own updated page; older tabs can finish using their loaded version.
 
 For headless use or detailed setup diagnostics, run `codex-accounts setup --terminal`.
 
@@ -213,15 +213,15 @@ See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [
 
 ### 2. Download and install Codexx
 
-For the published v0.13.1 release:
+For the published v0.13.2 release:
 
 ```sh
-git clone --branch v0.13.1 --depth 1 https://github.com/JoRo-Code/codexx.git
+git clone --branch v0.13.2 --depth 1 https://github.com/JoRo-Code/codexx.git
 cd codexx
 python3 install.py
 ```
 
-Alternatively, download `codexx-0.13.1.tar.gz` from [v0.13.1 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.13.1), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
+Alternatively, download `codexx-0.13.2.tar.gz` from [v0.13.2 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.13.2), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
 
 Already using `codex-accounts`? Run the same installer once. It retains accounts, history, settings and running services under `~/.local/share/codex-accounts`. You do not need to sign in again or restart existing chats. The old command remains supported. Already using a versioned Codexx installation? Use `codexx update` instead.
 
@@ -234,7 +234,7 @@ export PATH="$HOME/.local/bin:$PATH"
 codexx --bundle-version
 ```
 
-It should print `0.13.1` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
+It should print `0.13.2` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
 
 ### 4. Connect your accounts
 
