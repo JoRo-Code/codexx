@@ -5,8 +5,14 @@ from pathlib import Path
 binary=shutil.which('codex')
 if not binary:raise SystemExit('Codex CLI required')
 source=Path(__file__).with_name('codex-accounts').resolve()
+proactive='--proactive' in sys.argv
+live='--live' in sys.argv
 with tempfile.TemporaryDirectory(prefix='car-',dir='/tmp') as tmp:
     root=Path(tmp);address=root/'r.sock';sid=str(uuid.uuid4())
+    if live:
+        installed=root/'installed/codex-accounts';installed.parent.mkdir()
+        installed.write_text(source.read_text());source=installed
+    if proactive:(root/'routing-policy.json').write_text(json.dumps({'threshold':95}))
     for account in ('a','b'):
         home=root/'accounts'/account;home.mkdir(parents=True)
         (home/'auth.json').write_text('{}')
@@ -41,13 +47,36 @@ for line in sys.stdin:
     logfile=(root/'router.log').open('w+')
     runner=root/'runner.py'
     runner.write_text("""
-import importlib.machinery,importlib.util,sys,uuid
+import importlib.machinery,importlib.util,json,sys,uuid
 loader=importlib.machinery.SourceFileLoader('router_app',sys.argv[1])
 spec=importlib.util.spec_from_loader(loader.name,loader)
 app=importlib.util.module_from_spec(spec);loader.exec_module(app)
 class FaultBackend(app.Backend):
+    def __init__(self,name):
+        super().__init__(name)
+        with (app.ROOT/'backend-starts.jsonl').open('a') as f:
+            f.write(json.dumps({'account':name,'pid':self.process.pid})+'\\n')
     def send(self,message):
+        if message.get('method')=='account/read':
+            self.messages.append({'id':message['id'],'result':{'account':{'type':'chatgpt','planType':'pro','email':'fixture@example.test'},'requiresOpenaiAuth':True}})
+            return
+        if message.get('method')=='account/rateLimits/read':
+            self.messages.append({'id':message['id'],'result':{'ordinaryUsageAllowed':True,
+                'rateLimits':{'primary':{'usedPercent':97 if self.name=='a' else 0},'credits':{'hasCredits':True},'planType':'pro'}}})
+            return
+        if message.get('method')=='turn/interrupt':
+            self.messages.append({'id':message['id'],'result':{}})
+            self.messages.append({'method':'turn/completed','params':{'threadId':message['params']['threadId'],
+                'turn':{'id':'held-turn','status':'completed','items':[],'error':None}}})
+            return
+        if message.get('method')=='turn/start' and message['params']['input'][0]['text']=='Hold update test':
+            turn={'id':'held-turn','status':'inProgress','items':[]}
+            self.messages.append({'id':message['id'],'result':{'turn':turn}})
+            self.messages.append({'method':'turn/started','params':{'threadId':message['params']['threadId'],'turn':turn}})
+            return
         if message.get('method')!='turn/start': return super().send(message)
+        with (app.ROOT/'sent-turns.jsonl').open('a') as f:
+            f.write(json.dumps({'account':self.name,'input':message['params']['input']})+'\\n')
         # Inject protocol events only; never send inference requests.
         sid=message['params']['threadId'];turn={'id':str(uuid.uuid4()),'status':'inProgress','items':[]}
         self.messages.append({'id':message['id'],'result':{'turn':dict(turn)}})
@@ -57,6 +86,8 @@ class FaultBackend(app.Backend):
         else: turn.update(status='completed',error=None)
         self.messages.append({'method':'turn/completed','params':{'threadId':sid,'turn':turn}})
 app.MultiRouter.__init__.__defaults__=(None,FaultBackend)
+app.account_snapshot=lambda name,**kwargs: {'usage':{'ordinaryUsageAllowed':True,
+    'rateLimits':{'primary':{'usedPercent':97 if name=='a' else 0},'credits':{'hasCredits':True}}}}
 app.serve_router(sys.argv[2], 'a')
 """)
     server=subprocess.Popen(['python3',str(runner),str(source),str(address)],env=env,stderr=logfile)
@@ -102,6 +133,30 @@ app.serve_router(sys.argv[2], 'a')
         assert any('shared_fixture' in row['tools'] for row in c.rpc('mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
         listed=c.rpc('thread/list',{'sourceKinds':['cli','appServer','vscode'],'limit':100})['data']
         assert sid in {r['id'] for r in listed}, listed
+        if live:
+            def markers():return [json.loads(p.read_text()) for p in (root/'runs').glob('router-*.json')]
+            def wait_until(predicate):
+                deadline=time.monotonic()+15
+                while time.monotonic()<deadline:
+                    if predicate():return
+                    time.sleep(.05)
+                raise AssertionError('Live update timed out: '+repr(markers()))
+            c.rpc('turn/start',{'threadId':sid,'input':[{'type':'text','text':'Hold update test','text_elements':[]}]})
+            wait_until(lambda:any(m['session']==sid and m['phase']=='working' for m in markers()))
+            starts=(root/'backend-starts.jsonl').read_text()
+            source.write_text(source.read_text().replace("VERSION = '0.13.0'", "VERSION = '0.13.1'")+'''
+account_snapshot=lambda name,**kwargs: {'usage':{'ordinaryUsageAllowed':True,
+    'rateLimits':{'primary':{'usedPercent':97 if name=='a' else 0},'credits':{'hasCredits':True}}}}
+''')
+            wait_until(lambda:any(m['session']==other and m['tracking_version']=='0.13.1' for m in markers()))
+            assert any(m['session']==sid and m['tracking_version']=='0.13.0' and m['phase']=='working' for m in markers())
+            assert (root/'backend-starts.jsonl').read_text()==starts
+            assert b.rpc('thread/read',{'threadId':other})['thread']['id']==other
+            c.rpc('turn/interrupt',{'threadId':sid,'turnId':'held-turn'})
+            wait_until(lambda:any(m['session']==sid and m['tracking_version']=='0.13.1' for m in markers()))
+            assert (root/'backend-starts.jsonl').read_text()==starts
+            assert c.rpc('thread/read',{'threadId':sid})['thread']['id']==sid
+            assert any('shared_fixture' in row['tools'] for row in c.rpc('mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
         c.rpc('turn/start',{'threadId':sid,'input':[{'type':'text','text':'Injected test only','text_elements':[]}]})
         deadline=time.monotonic()+15
         while time.monotonic()<deadline:
@@ -116,8 +171,15 @@ app.serve_router(sys.argv[2], 'a')
             assert (root/'accounts'/name/'auth.json').read_text()=='{}'
             assert (root/'accounts'/name/'config.toml').resolve()==(common/'config.toml').resolve()
         assert set(b.rpc('thread/loaded/list',{})['data'])=={sid,other}
-
-        print('PASS: native proxy, two chats, reconnect, combined history and shared MCP tools after injected quota failover; separate credentials, no model requests.')
+        sent=[json.loads(line) for line in (root/'sent-turns.jsonl').read_text().splitlines()]
+        if proactive:
+            assert [row['account'] for row in sent]==['b'],sent
+            assert sent[0]['input'][0]['text']=='Injected test only',sent
+            print('PASS: proactive quota rotation before original input, native history and MCP tools preserved, second chat accessible; no model requests.')
+        else:
+            assert [row['account'] for row in sent]==['a','b'],sent
+            print('PASS: native proxy, two chats, reconnect, combined history and shared MCP tools after injected quota failover; separate credentials, no model requests.')
+        if live:print('PASS: installed file update during active turn; idle chat adopts immediately, active chat after completion; same clients and backend PIDs, shared MCP retained.')
     finally:
         for c in clients:c.close()
         server.terminate()

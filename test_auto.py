@@ -179,6 +179,154 @@ class AutoTests(unittest.TestCase):
             bridge.from_backend(self.completion())
         self.assertTrue(any(x.get('id')==55 and 'error' in x for x in bridge.ws.sent))
 
+    def quota_policy(self, threshold=95):
+        app.atomic_json(app.ROOT/'routing-policy.json', {'threshold':threshold})
+
+    def usage(self, percent=0, allowed=True, secondary=None):
+        return {'ordinaryUsageAllowed':allowed, 'rateLimits':{
+            'primary':{'usedPercent':percent}, 'secondary':secondary,
+            'credits':{'hasCredits':True, 'unlimited':True}}}
+
+    def test_proactive_rotation_forwards_original_input_once_with_settings(self):
+        bridge=self.make_bridge();original=bridge.backend
+        bridge.thread_options.update(model='saved-model',sandbox='danger-full-access',approvalPolicy='never')
+        self.quota_policy()
+        message={'id':88,'method':'turn/start','params':{'threadId':self.sid,'model':'chosen-model',
+            'effort':'high','input':[{'type':'text','text':'Exact original request'}]}}
+        def rpc(method,params):
+            if method=='account/rateLimits/read':return self.usage(97 if bridge.name=='personal' else 0)
+            return self.fake_rpc(method,params)
+        with patch.object(bridge,'rpc',side_effect=rpc) as calls, patch.object(app,'account_snapshot',return_value={'usage':self.usage()}):
+            bridge.from_client(message)
+        self.assertTrue(original.closed)
+        self.assertEqual(bridge.name,'work')
+        self.assertFalse(any(m.get('method')=='turn/start' for m in original.sent))
+        self.assertEqual(bridge.backend.sent.count(message),1)
+        self.assertEqual(sum(m.get('method')=='turn/start' for m in bridge.backend.sent),1)
+        self.assertEqual(app.choose_session(self.sid)['account'],'work')
+        resume=next(c.args[1] for c in calls.call_args_list if c.args[0]=='thread/resume')
+        self.assertEqual(resume['sandbox'],'danger-full-access')
+        self.assertEqual(resume['approvalPolicy'],'never')
+        self.assertTrue(any(e['event']=='quota_rotation' for e in app.activity_records()))
+
+    def test_unsaved_new_chat_accepts_first_turn_then_rotates_when_saved(self):
+        bridge = self.make_bridge()
+        original = bridge.backend
+        self.path.unlink()  # Native thread/start can return before history exists.
+        self.quota_policy()
+        message = {'id': 88, 'method': 'turn/start', 'params': {
+            'threadId': self.sid, 'input': [{'type': 'text', 'text': 'First request'}]}}
+
+        def rpc(method, params):
+            return self.usage(97) if method == 'account/rateLimits/read' else self.fake_rpc(method, params)
+
+        with patch.object(bridge, 'rpc', side_effect=rpc), patch.object(
+                app, 'account_snapshot', return_value={'usage': self.usage()}):
+            bridge.from_client(message)
+            self.assertEqual(original.sent, [message])
+            self.assertFalse(original.closed)
+            self.assertFalse(any('error' in m for m in bridge.ws.sent))
+            self.assertFalse(any(e['event'] == 'quota_rotation' for e in app.activity_records()))
+
+            # Once the first turn is saved, normal proactive routing still works.
+            self.path.write_text(''.join(json.dumps(x) + '\n' for x in self.rows))
+            bridge.inspect({'method': 'turn/completed', 'params': {
+                'threadId': self.sid, 'turn': {'id': 'first', 'status': 'completed'}}})
+            next_message = {'id': 89, 'method': 'turn/start', 'params': {
+                'threadId': self.sid, 'input': [{'type': 'text', 'text': 'Next request'}]}}
+            bridge.from_client(next_message)
+        self.assertTrue(original.closed)
+        self.assertEqual(bridge.name, 'work')
+        self.assertEqual(original.sent, [message])
+        self.assertEqual(bridge.backend.sent.count(next_message), 1)
+
+    def test_credits_do_not_override_ordinary_quota_or_threshold(self):
+        self.assertFalse(app.ordinary_quota_ready(self.usage(100),95))
+        self.assertFalse(app.ordinary_quota_ready(self.usage(95),95))
+        self.assertFalse(app.ordinary_quota_ready(self.usage(0,False),95))
+        self.assertFalse(app.ordinary_quota_ready(self.usage(0,secondary={'usedPercent':97}),95))
+        self.assertTrue(app.ordinary_quota_ready(self.usage(94),95))
+        self.assertFalse(app.ordinary_quota_ready({},95))
+        self.assertFalse(app.ordinary_quota_ready(self.usage(None),95))
+
+    def test_all_accounts_over_threshold_continue_on_current_account(self):
+        bridge=self.make_bridge();original=bridge.backend;self.quota_policy()
+        with patch.object(bridge,'rpc',return_value=self.usage(97)), patch.object(app,'account_snapshot',return_value={'usage':self.usage(100)}):
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid,'input':[]}})
+        self.assertIs(bridge.backend,original)
+        self.assertFalse(original.closed)
+        self.assertEqual(sum(m.get('method')=='turn/start' for m in original.sent),1)
+        self.assertFalse(any(m.get('id')==7 and 'error' in m for m in bridge.ws.sent))
+
+    def test_unknown_limits_do_not_block_current_account(self):
+        bridge=self.make_bridge();self.quota_policy()
+        with patch.object(bridge,'rpc',side_effect=app.Error('offline')):
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid}})
+        self.assertEqual(len(bridge.backend.sent),1)
+        self.assertFalse(any(m.get('id')==7 and 'error' in m for m in bridge.ws.sent))
+
+    def test_missing_limits_do_not_trigger_a_migration(self):
+        bridge=self.make_bridge();self.quota_policy();original=bridge.backend
+        with patch.object(bridge,'rpc',return_value={}), patch.object(app,'account_snapshot') as lookup:
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid}})
+        lookup.assert_not_called()
+        self.assertIs(bridge.backend,original)
+        self.assertEqual(len(original.sent),1)
+
+    def test_unknown_alternative_limits_leave_current_account_usable(self):
+        bridge=self.make_bridge();self.quota_policy();original=bridge.backend
+        with patch.object(bridge,'rpc',return_value=self.usage(97)), patch.object(app,'account_snapshot',side_effect=app.Error('offline')):
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid}})
+        self.assertIs(bridge.backend,original)
+        self.assertEqual(len(original.sent),1)
+
+    def test_exact_threshold_triggers_rotation(self):
+        bridge=self.make_bridge();self.quota_policy()
+        def rpc(method,params):
+            return self.usage(95) if method=='account/rateLimits/read' else self.fake_rpc(method,params)
+        with patch.object(bridge,'rpc',side_effect=rpc), patch.object(app,'account_snapshot',return_value={'usage':self.usage(94)}):
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid}})
+        self.assertEqual(bridge.name,'work')
+        self.assertEqual(sum(m.get('method')=='turn/start' for m in bridge.backend.sent),1)
+
+    def test_active_turn_is_never_interrupted_for_proactive_rotation(self):
+        bridge=self.make_bridge();self.quota_policy();bridge.phase='working'
+        with patch.object(bridge,'rpc') as rpc:
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid}})
+        rpc.assert_not_called()
+        self.assertFalse(bridge.backend.closed)
+        self.assertEqual(len(bridge.backend.sent),1)
+
+    def test_eligible_current_account_keeps_backend_and_sends_request(self):
+        bridge=self.make_bridge();self.quota_policy();original=bridge.backend
+        message={'id':7,'method':'turn/start','params':{'threadId':self.sid}}
+        with patch.object(bridge,'rpc',return_value=self.usage(94)), patch.object(app,'account_snapshot') as lookup:
+            bridge.from_client(message)
+        lookup.assert_not_called()
+        self.assertIs(bridge.backend,original)
+        self.assertEqual(original.sent,[message])
+
+    def test_reactive_failover_can_use_credits_if_ordinary_quota_unavailable(self):
+        bridge=self.make_bridge();self.quota_policy()
+        with patch.object(app,'account_snapshot',return_value={'usage':self.usage(100)}), patch.object(bridge,'rpc',side_effect=self.fake_rpc) as rpc:
+            bridge.from_backend(self.completion())
+        self.assertTrue(rpc.called)
+        self.assertEqual(bridge.name,'work')
+
+    def test_quota_race_does_not_block_use_of_replacement_credits(self):
+        bridge=self.make_bridge();self.quota_policy()
+        with patch.object(bridge,'rpc',side_effect=lambda m,p:self.usage(100) if m=='account/rateLimits/read' else self.fake_rpc(m,p)), patch.object(app,'account_snapshot',return_value={'usage':self.usage(0)}):
+            bridge.from_client({'id':7,'method':'turn/start','params':{'threadId':self.sid}})
+        self.assertEqual(bridge.name,'work')
+        self.assertTrue(any(m.get('method')=='turn/start' for m in bridge.backend.sent))
+        self.assertFalse(any(m.get('id')==7 and 'error' in m for m in bridge.ws.sent))
+
+    def test_routing_policy_can_be_configured_and_disabled(self):
+        with contextlib.redirect_stdout(io.StringIO()):app.main(['routing','--threshold','90'])
+        self.assertEqual(app.routing_threshold(),90)
+        with contextlib.redirect_stdout(io.StringIO()):app.main(['routing','--off'])
+        self.assertIsNone(app.routing_threshold())
+
 class TransportTests(unittest.TestCase):
     def test_masked_fragmented_messages_and_ping(self):
         server,client=socket.socketpair();self.addCleanup(server.close);self.addCleanup(client.close)

@@ -19,7 +19,9 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.12.1'
+VERSION = '0.13.0'
+# Bump only when live object state/protocol can no longer be adopted in place.
+LIVE_RUNTIME_ABI = 1
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -377,10 +379,54 @@ def defaults(model=None, effort=None, clear=False):
     print(json.dumps(settings, indent=2) if settings else 'Use each account’s Codex configuration.')
     print('Applies to new launches across all accounts. --model and in-chat selections override defaults.')
 
-def command(*args, include_permissions=True):
-    if not shutil.which(BINARY):
+def runtime_binary():
+    """Keep packaged Codex helpers alive when a package manager removes a release.
+
+    A running app-server resolves code-mode-host and resources lazily. Pin the
+    complete declared package, not just its executable or a helper from a newer
+    release. Unpackaged/custom entry points retain their existing behavior.
+    """
+    located = shutil.which(BINARY)
+    if not located:
         raise Error('Codex CLI was not found on PATH. Install Codex first.')
-    return [BINARY, *args, '-c', 'cli_auth_credentials_store="file"',
+    executable = Path(located).resolve()
+    source = executable.parent.parent
+    manifest = source / 'codex-package.json'
+    if not manifest.is_file():
+        return BINARY
+    package = read_json(manifest)
+    if package.get('layoutVersion') != 1 or package.get('entrypoint') != 'bin/codex':
+        raise Error('Unsupported Codex package layout; cannot preserve its tool runtime.')
+    if executable != source / 'bin/codex':
+        return BINARY
+    # Include file identities so reinstalling the same version creates a fresh
+    # snapshot. Never garbage-collect these while old backends may still use them.
+    entries = []
+    for path in sorted(source.rglob('*')):
+        st = path.stat()
+        entries.append((str(path.relative_to(source)), st.st_size, st.st_mtime_ns, st.st_ino))
+    identity = hashlib.sha256(json.dumps([str(source), entries]).encode()).hexdigest()
+    cache = ROOT / 'native-runtimes'
+    private_dir(cache)
+    destination = cache / identity
+    with (cache / '.lock').open('a') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        if not destination.exists():
+            temporary = Path(tempfile.mkdtemp(prefix='.staging-', dir=cache))
+            try:
+                shutil.copytree(source, temporary / 'package', symlinks=False)
+                # Detect removal/replacement during an upgrade before publishing.
+                for relative, size, modified, inode in entries:
+                    st = (source / relative).stat()
+                    if (st.st_size, st.st_mtime_ns, st.st_ino) != (size, modified, inode):
+                        raise Error('Codex changed during runtime capture. Retry after its update finishes.')
+                os.replace(temporary / 'package', destination)
+            finally:
+                shutil.rmtree(temporary)
+    return str(destination / 'bin/codex')
+
+def command(*args, include_permissions=True):
+    return [runtime_binary(), *args, '-c', 'cli_auth_credentials_store="file"',
             '-c', 'forced_login_method="chatgpt"', '-c', 'model_provider="openai"',
             *model_args(), *(permission_args() if include_permissions else [])]
 
@@ -1236,12 +1282,24 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-RELEASE_REPO = 'JoRo-Code/codex-account-switcher'
+RELEASE_REPO = 'JoRo-Code/codexx'
 RELEASE_API = 'https://api.github.com/repos/' + RELEASE_REPO + '/releases?per_page=100'
 UPDATE_INTERVAL = 3600
 
 def executable_path():
-    return Path(__file__).resolve()
+    path = Path(__file__).resolve()
+    marker = read_json(install_marker(path), {})
+    if marker.get('bundle_root'):
+        return Path(marker['bundle_root']) / 'current/codex-accounts'
+    return path
+
+def bundle_updates():
+    import importlib.util
+    path = executable_path().resolve().with_name('codexx_updates.py')
+    spec = importlib.util.spec_from_file_location('codexx_bundle_updates', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def install_marker(path):
     return path.with_name('.' + path.name + '.install.json')
@@ -1365,10 +1423,13 @@ def update_policy(policy=None):
         if policy: record_update(policy=policy)
         selected = update_settings().get('policy', 'auto')
     print('Update policy: ' + selected)
-    print('Automatic checks run at launch, at most once an hour. Running sessions are not restarted.')
+    print('Automatic checks run at launch and in long-running automatic sessions, at most once an hour.')
 
 def self_update(check=False, rollback=False, prerelease=False):
     destination = executable_path()
+    if read_json(install_marker(destination), {}).get('bundle_root'):
+        return bundle_updates().update(sys.modules.get(__name__) or types.SimpleNamespace(**globals()),
+                                       check=check, rollback=rollback, prerelease=prerelease)
     if not check and any((parent / '.git').exists() for parent in destination.parents):
         raise Error('This is a source checkout. Run the installed codex-accounts update, or use git pull here.')
     backup = destination.with_name('.' + destination.name + '.previous')
@@ -1403,7 +1464,7 @@ def self_update(check=False, rollback=False, prerelease=False):
         atomic_json(install_marker(destination), {'repository': RELEASE_REPO, 'version': target})
         record_update(installed_version=target)
         print(f'Updated {current} -> {target}. Accounts and history are unchanged.')
-        print('Running conversations keep their current version; new launches use the update.')
+        print('Compatible running routers/automatic terminals adopt the update between requests, without restarting backends.')
         return True
 
 def maybe_auto_update():
@@ -1450,6 +1511,11 @@ def parser():
     s = sub.add_parser('serve', help='Persistent multi-session account router (experimental)')
     s.add_argument('--socket', required=True)
     s.add_argument('--account', help='Preferred account for new chats')
+    s = sub.add_parser('routing', help='Rotate before ordinary quota is exhausted')
+    flags = s.add_mutually_exclusive_group()
+    flags.add_argument('--threshold', type=int, choices=range(1, 101), metavar='1-100',
+                       help='Maximum used quota before switching; credits do not count as ordinary quota')
+    flags.add_argument('--off', action='store_true', help='Use reactive quota-error failover only')
     s = sub.add_parser('overview', help='Conversations, accounts, active sessions, and recorded account history')
     s.add_argument('query', nargs='*', help='Filter by title, project, or session ID')
     s.add_argument('--account', help='Include chats currently or historically recorded under this label')
@@ -1530,6 +1596,13 @@ def main(argv=None):
         return 0
     if args.action == 'serve':
         return serve_router(args.socket, args.account)
+    if args.action == 'routing':
+        if args.threshold is not None or args.off:
+            atomic_json(ROOT/'routing-policy.json', {'threshold': args.threshold})
+        threshold = routing_threshold()
+        print('Pre-turn quota rotation: '+(str(threshold)+'% used; current account remains usable if no alternative qualifies.'
+                                           if threshold is not None else 'off (quota-error failover only).'))
+        return 0
     if args.action == 'permissions':
         permissions(args.mode)
         return 0
@@ -1694,6 +1767,35 @@ def mark_selected(name):
     with routing_state() as state:
         state.setdefault(name, {})['last_selected'] = time.time()
 
+def routing_threshold():
+    threshold = (read_json(ROOT/'routing-policy.json', {}) or {}).get('threshold')
+    if threshold is not None and (type(threshold) is not int or not 1 <= threshold <= 100):
+        raise Error('Invalid quota rotation threshold; use codex-accounts routing --threshold 95.')
+    return threshold
+
+def ordinary_quota_ready(usage, threshold):
+    """Require known ordinary quota; available credits never make a window eligible."""
+    if not isinstance(usage, dict): return False
+    if usage.get('ordinaryUsageAllowed') is False: return False
+    limits = usage.get('rateLimits') or (usage.get('rateLimitsByLimitId') or {}).get('codex') or {}
+    windows = [limits.get(key) for key in ('primary', 'secondary') if limits.get(key) is not None]
+    if not windows: return False
+    return all(isinstance(window, dict) and type(window.get('usedPercent')) in (int, float)
+               and 0 <= window['usedPercent'] < threshold for window in windows)
+
+def quota_ready_accounts(exclude=()):
+    choices = eligible_accounts(exclude)
+    threshold = routing_threshold()
+    if threshold is None: return choices
+    ready = []
+    for name in choices:
+        try:
+            report = account_snapshot(name, include_usage=True)
+            if ordinary_quota_ready(report.get('usage'), threshold): ready.append(name)
+        except (Error, OSError, ValueError):
+            continue
+    return ready
+
 def mark_quota_failure(name, error, snapshot=None):
     windows = [(snapshot or {}).get(k) or {} for k in ('primary','secondary')]
     resets = [w.get('resetsAt') for w in windows if w.get('usedPercent', 0) >= 100
@@ -1791,6 +1893,8 @@ class AutoBridge:
     def update_marker(self):
         atomic_json(self.marker, dict(pid=os.getpid(),account=self.name,session=self.sid,
                                      tracking_version=VERSION,
+                                     live_runtime_abi=LIVE_RUNTIME_ABI,
+                                     launcher_generation=getattr(self, '_live_generation', None),
                                      cwd=self.thread_options.get('cwd') or self.cwd, started=self.started,
                                      updated=time.time(),mode='auto',phase=self.phase,
                                      model=self.thread_options.get('model'),title=self.title))
@@ -1829,6 +1933,11 @@ class AutoBridge:
                 k:v for k,v in params.items() if k in
                 ('model','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','personality','config')}
         if method == 'turn/start' and self.sid and params.get('threadId') == self.sid:
+            try:
+                self.prepare_turn()
+            except (Error, OSError, ValueError, sqlite3.Error) as exc:
+                self.ws.send(dict(id=message.get('id'), error=dict(code=-32000, message=str(exc))))
+                return
             self.phase = 'starting turn'
             if not self.title:
                 self.title = next((x.get('text') for x in params.get('input', []) if x.get('type') == 'text'), None)
@@ -1841,6 +1950,55 @@ class AutoBridge:
         if 'id' in message and method:
             self.pending[json.dumps(message['id'])] = method
         self.backend.send(message)
+
+    def prepare_turn(self):
+        threshold = routing_threshold()
+        if threshold is None: return
+        # Never stop tools or copy history while the previous turn is still active.
+        if self.phase in ('working', 'starting turn', 'waiting for input'):
+            return
+        # Native thread/start may not persist history until its first turn.
+        # Migration needs that history; blocking the turn here would prevent
+        # it from ever being written. Let the current backend accept it first.
+        if not any(row['id'] == self.sid for row in session_records(self.name)):
+            return
+        try:
+            usage = self.rpc('account/rateLimits/read', {})
+        except (Error, OSError, ValueError):
+            return  # Quota rotation is a preference, not a ban on credit use.
+        limits = usage.get('rateLimits') or (usage.get('rateLimitsByLimitId') or {}).get('codex') or {}
+        windows = [limits.get(key) or {} for key in ('primary', 'secondary')]
+        if usage.get('ordinaryUsageAllowed') is not False and not any(
+                type(w.get('usedPercent')) in (int, float) and w['usedPercent'] >= threshold for w in windows):
+            return  # Missing quota data alone is not a reason to migrate.
+        if ordinary_quota_ready(usage, threshold): return
+        choices = quota_ready_accounts({self.name})
+        if not choices:
+            return
+        record_activity(self.sid, self.name, 'quota_rotation', cwd=self.thread_options.get('cwd') or self.cwd,
+                        title=self.title)
+        self.reconnect_account(choices[0])
+
+    def reconnect_account(self, target):
+        row = choose_session(self.sid)
+        self.phase = 'switching account'
+        self.update_marker()
+        self.close_backend()
+        self.marker.unlink(missing_ok=True)
+        for ident in list(self.pending):
+            self.ws.send(dict(id=json.loads(ident), error=dict(code=-32000,message='Account is reconnecting; retry this request.')))
+        self.pending.clear()
+        self.pending_thread_options.clear()
+        move(row, target, already_locked=True, quiet=True)
+        self.open_backend(target)
+        self.rpc('initialize', self.initialize)
+        self.backend.send(dict(method='initialized'))
+        resume_options = dict(self.thread_options, threadId=self.sid)
+        if row['history_mode'] == 'paginated': resume_options['excludeTurns'] = True
+        resumed = self.rpc('thread/resume', resume_options)
+        self.set_thread(resumed['thread'])
+        account = self.rpc('account/read', {'refreshToken':False}).get('account') or {}
+        self.ws.send(dict(method='account/updated',params=dict(authMode='chatgpt',planType=account.get('planType'))))
     def inspect(self, message):
         method, params = message.get('method'), message.get('params', {})
         if params.get('threadId') == self.sid and self.sid:
@@ -1905,36 +2063,15 @@ class AutoBridge:
         record_activity(self.sid, self.name, info, cwd=self.thread_options.get('cwd') or self.cwd, title=self.title)
         mark_quota_failure(self.name, info, self.snapshot)
         self.tried.add(self.name)
-        choices = eligible_accounts(self.tried)
+        choices = quota_ready_accounts(self.tried)
+        if not choices: choices = eligible_accounts(self.tried)
         if not choices or not self.sid:
             return  # Original quota failure is already visible in the native TUI.
         target = choices[0]
         # Backend has reported the failed turn completed. Stop it before copying
         # history, so no tools or history writers survive on the source account.
-        row = choose_session(self.sid)
-        self.phase = 'switching account'
-        self.update_marker()
-        self.close_backend()
-        self.marker.unlink(missing_ok=True)
-        # No in-flight request may be silently abandoned during reconnection.
-        for ident in list(self.pending):
-            self.ws.send(dict(id=json.loads(ident), error=dict(code=-32000,message='Account is reconnecting; retry this request.')))
-        self.pending.clear()
-        self.pending_thread_options.clear()
-        # The bridge already owns this conversation's exclusive lock.
-        move(row, target, already_locked=True, quiet=True)
-        self.open_backend(target)
-        self.rpc('initialize', self.initialize)
-        self.backend.send(dict(method='initialized'))
-        resume_options = dict(self.thread_options, threadId=self.sid)
-        if row['history_mode'] == 'paginated':
-            resume_options['excludeTurns'] = True
-        resumed = self.rpc('thread/resume', resume_options)
-        self.set_thread(resumed['thread'])
+        self.reconnect_account(target)
         self.tried.add(target)
-        # Publish the new account's plan to the existing native UI.
-        account = self.rpc('account/read', {'refreshToken':False}).get('account') or {}
-        self.ws.send(dict(method='account/updated',params=dict(authMode='chatgpt',planType=account.get('planType'))))
         continuation = ('Continue the unfinished request from the preceding turn. The account reached its usage limit '
                         'and the launcher reconnected this conversation using another account. Inspect the saved history '
                         'and current state, preserve completed work, and do not repeat completed side effects.')
@@ -2011,10 +2148,13 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
                 raise Error('Codex terminal did not connect within 30 seconds.')
             connected.settimeout(5)
             ws = WebSocket(connected)
+            runtime = LiveRuntime()
             bridge = AutoBridge(account, ws, marker, cwd=working)
             while tui.poll() is None:
                 while bridge.backend.messages:
                     bridge.from_backend(bridge.backend.messages.popleft())
+                runtime.refresh()
+                adopt_bridge_runtime(bridge, runtime)
                 ready,_,_ = select.select([connected,bridge.backend.process.stdout],[],[],.25)
                 if connected in ready:
                     for message in ws.read(): bridge.from_client(message)
@@ -2024,6 +2164,7 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
             return tui.wait(timeout=5) if tui else 0
         finally:
             if bridge: bridge.close()
+            if 'runtime' in locals(): runtime.close()
             if tui and tui.poll() is None:
                 tui.terminate()
                 try: tui.wait(timeout=5)
@@ -2041,6 +2182,141 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
 import queue
 import threading
 from concurrent.futures import Future
+import types
+
+class LiveRuntime:
+    """Load compatible generations while sockets, actor state and backends survive."""
+    def __init__(self, source=None, namespace=None):
+        self.source = Path(source or executable_path())
+        self.module = types.SimpleNamespace(**(namespace or dict(globals())))
+        self.mutex = threading.RLock()
+        self.fingerprint = None
+        self.checked = 0
+        self.error = None
+        self.updater = None
+        self.updater_started = 0
+        try:
+            self.fingerprint = hashlib.sha256(self.source.read_bytes()).hexdigest()
+            self.file_state = self.stamp()
+        except OSError: self.file_state = None
+
+    def stamp(self):
+        info = self.source.stat()
+        return (info.st_ino, info.st_size, info.st_mtime_ns)
+
+    def refresh(self, force=False):
+        with self.mutex:
+            requested = (read_json(ROOT / 'session-updates.json', {}) or {}).get('requested_at')
+            if requested and requested != getattr(self, '_session_update_request', None):
+                self._session_update_request = requested
+                force = True
+            now = time.monotonic()
+            if not force and now-self.checked < 1: return self.module
+            self.checked = now
+            try: self.check_update()
+            except (OSError, subprocess.SubprocessError): pass
+            try:
+                stamp = self.stamp()
+                if stamp == self.file_state: return self.module
+                payload = self.source.read_bytes()
+                digest = hashlib.sha256(payload).hexdigest()
+                self.file_state = stamp
+                if digest == self.fingerprint: return self.module
+                candidate = types.ModuleType('codex_accounts_live_'+digest)
+                candidate.__file__ = str(self.source)
+                exec(compile(payload, str(self.source), 'exec'), candidate.__dict__)
+                if getattr(candidate, 'LIVE_RUNTIME_ABI', None) != LIVE_RUNTIME_ABI:
+                    raise Error('Installed update requires a newer live-state ABI; current chats continue on their loaded code.')
+                for name in ('AutoBridge','MultiRouter','Backend','RouterLane','router_bridge_class'):
+                    if not callable(getattr(candidate, name, None)):
+                        raise Error('Installed update is missing live runtime exports: '+name)
+                for name in ('AutoBridge','MultiRouter','Backend','RouterLane'):
+                    cls = getattr(candidate, name)
+                    if not isinstance(cls, type) or '__slots__' in cls.__dict__:
+                        raise Error('Installed update has incompatible live object layout: '+name)
+                # Keep the process's explicit home/binary and one exception identity.
+                candidate.ROOT, candidate.BINARY, candidate.Error = ROOT, BINARY, Error
+                self.module = candidate
+                self.fingerprint = digest
+                self.error = None
+                print('Live launcher update ready ('+candidate.VERSION+'); chats adopt it when idle.',
+                      file=sys.stderr, flush=True)
+            except Exception as exc:
+                message = str(exc)
+                if message != self.error:
+                    print('Live launcher update deferred: '+message, file=sys.stderr, flush=True)
+                self.error = message
+            return self.module
+
+    def check_update(self):
+        # Network checks run in a separate process; a long model turn never waits.
+        if self.updater:
+            if self.updater.poll() is not None: self.updater = None
+            elif time.monotonic()-self.updater_started > 45:
+                self.updater.terminate()
+            return
+        if os.environ.get('CODEX_ACCOUNTS_NO_UPDATE') == '1': return
+        try:
+            if read_json(install_marker(self.source), {}).get('repository') != RELEASE_REPO: return
+            with lock('update'):
+                settings = update_settings()
+                if settings.get('policy','auto') == 'off' or time.time()-settings.get('last_check',0) < UPDATE_INTERVAL: return
+                record_update(last_check=time.time())
+            args = [sys.executable, str(self.source), 'update']
+            if settings.get('policy') == 'notify': args.append('--check')
+            self.updater = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, start_new_session=True,
+                                           env=dict(os.environ, CODEX_ACCOUNTS_HOME=str(ROOT), CODEX_ACCOUNTS_NO_UPDATE='1'))
+            self.updater_started = time.monotonic()
+        except (Error, OSError, ValueError): pass
+
+    def close(self):
+        if self.updater and self.updater.poll() is None:
+            self.updater.terminate()
+            try: self.updater.wait(timeout=5)
+            except subprocess.TimeoutExpired: self.updater.kill(); self.updater.wait()
+
+def adopt_bridge_runtime(bridge, runtime, lane=None):
+    # Adoption occurs only in the owning actor, outside an active turn/RPC/approval.
+    if bridge.phase in ('working','starting turn','waiting for input','switching account'):
+        return False
+    if bridge.pending or bridge.approvals or bridge.backend.messages: return False
+    with runtime.mutex:
+        module, fingerprint = runtime.module, runtime.fingerprint
+    if getattr(bridge, '_live_generation', None) == fingerprint: return False
+    bridge.__class__ = module.router_bridge_class(lane) if lane is not None else module.AutoBridge
+    if bridge.backend.__class__.__dict__.get('_live_native_backend', False):
+        bridge.backend.__class__ = module.Backend
+    if bridge.factory is Backend or bridge.factory.__dict__.get('_live_native_backend', False):
+        bridge.factory = module.Backend
+    bridge._live_generation = fingerprint
+    if lane is None or not lane.control: bridge.update_marker()
+    return True
+
+def router_bridge_class(lane):
+    class Bridge(AutoBridge):
+        def update_marker(self):
+            if self.sid and not lane.control: super().update_marker()
+        def open_backend(self, name):
+            lane.generation += 1
+            super().open_backend(name)
+        def set_thread(self, thread):
+            if lane.control or thread.get('ephemeral'): return
+            if self.sid and thread['id'] != self.sid: return
+            super().set_thread(thread)
+        def failover(self, info):
+            try: super().failover(info)
+            except (Error, OSError, ValueError, sqlite3.Error) as exc:
+                self.phase = 'switch failed'
+                self.update_marker()
+                lane.router.notice(self.sid, 'Account switch failed: '+str(exc))
+            if self.phase == 'failed':
+                self.phase = 'waiting for quota'
+                self.update_marker()
+                lane.router.notice(self.sid, 'No other account is ready. Resume after an account reset or add another account.')
+    return Bridge
+
+Backend._live_native_backend = True
 
 class RouterLane:
     def __init__(self, router, account, initialize, control=False):
@@ -2068,32 +2344,9 @@ class RouterLane:
         return result.result(timeout=45)
 
     def run(self, account, initialize):
-        lane = self
-        class Bridge(AutoBridge):
-            def update_marker(self):
-                if self.sid and not lane.control: super().update_marker()
-            def open_backend(self, name):
-                lane.generation += 1
-                super().open_backend(name)
-            def set_thread(self, thread):
-                if lane.control or thread.get('ephemeral'): return
-                # Descendant/helper responses must not replace the root actor.
-                if self.sid and thread['id'] != self.sid: return
-                super().set_thread(thread)
-            def failover(self, info):
-                # Track quota even if no alternative is currently eligible.
-                try: super().failover(info)
-                except (Error, OSError, ValueError, sqlite3.Error) as exc:
-                    self.phase = 'switch failed'
-                    self.update_marker()
-                    lane.router.notice(self.sid, 'Account switch failed: '+str(exc))
-                if self.phase == 'failed':
-                    self.phase = 'waiting for quota'
-                    self.update_marker()
-                    lane.router.notice(self.sid, 'No other account is ready. Resume after an account reset or add another account.')
         try:
             marker = ROOT/'runs'/('router-'+str(uuid.uuid4())+'.json')
-            self.bridge = Bridge(account, self, marker, factory=self.router.factory)
+            self.bridge = self.router.runtime.module.router_bridge_class(self)(account, self, marker, factory=self.router.factory)
             self.bridge.initialize = initialize
             response = self.bridge.rpc('initialize', initialize)
             self.bridge.backend.send({'method':'initialized'})
@@ -2107,11 +2360,15 @@ class RouterLane:
                     try: future.set_result(self.bridge.rpc(*value))
                     except Exception as exc: future.set_exception(exc)
                 elif kind == 'send':
+                    self.router.runtime.refresh()
+                    adopt_bridge_runtime(self.bridge, self.router.runtime, self)
                     self.bridge.from_client(value)
                 while self.bridge.backend.messages:
                     self.bridge.from_backend(self.bridge.backend.messages.popleft())
                 if select.select([self.bridge.backend.process.stdout], [], [], .02)[0]:
                     self.bridge.backend.read()
+                self.router.runtime.refresh()
+                adopt_bridge_runtime(self.bridge, self.router.runtime, self)
         except Exception as exc:
             if not self.ready.done(): self.ready.set_exception(exc)
             self.router.lane_failed(self, str(exc))
@@ -2129,6 +2386,7 @@ class RouterLane:
 class MultiRouter:
     def __init__(self, preferred=None, factory=Backend):
         self.preferred, self.factory = preferred, factory
+        self.runtime = LiveRuntime()
         self.mutex = threading.RLock()
         self.clients = set()
         self.client_initializes = {}
@@ -2227,6 +2485,10 @@ class MultiRouter:
                     self.requests[ident] = (None, *pending[1:])
 
     def route(self, client, message):
+        module = self.runtime.refresh()
+        with self.mutex:
+            self.__class__ = module.MultiRouter
+            if self.factory.__dict__.get('_live_native_backend', False): self.factory = module.Backend
         if self.closed: raise Error('Router is shutting down.')
         method, params = message.get('method'), message.get('params') or {}
         ident = message.get('id')
@@ -2338,6 +2600,7 @@ class MultiRouter:
             lanes = list(self.lanes)
             for lane in lanes: lane.stopped.set()
         for lane in lanes: lane.close()
+        self.runtime.close()
 
 class JsonSocket:
     """Native app-server proxy uses newline JSON on its control socket."""
@@ -2406,6 +2669,7 @@ def _serve_router(address, preferred=None):
         listener.bind(str(path));path.chmod(0o600);listener.listen(16);listener.settimeout(.25)
         print('Multi-session router listening on '+str(path),file=sys.stderr,flush=True)
         while not stopping.is_set():
+            router.runtime.refresh()
             try: sock,_=listener.accept()
             except socket.timeout: continue
             thread=threading.Thread(target=connected,args=(sock,),daemon=True)
