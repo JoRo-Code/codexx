@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 
 
@@ -179,6 +180,35 @@ class ChatFilter:
         return 'id' not in message
 
 
+class TerminalState:
+    """Restore shell modes even when the native TUI cannot run its cleanup."""
+    def __init__(self, stream):
+        self.fd = None
+        try:
+            fd = stream.fileno()
+            if os.isatty(fd):
+                self.attrs = termios.tcgetattr(fd)
+                self.fd = fd
+        except (AttributeError, OSError, ValueError, termios.error):
+            pass
+
+    def restore(self):
+        if self.fd is None:
+            return
+        # Mouse tracking and paste mode are terminal-emulator state, not termios.
+        try:
+            os.write(self.fd, b'\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l'
+                     b'\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l'
+                     b'\x1b[?1049l\x1b[?25h\x1b[0m')
+        except OSError:
+            pass
+        try:
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.attrs)
+            termios.tcflush(self.fd, termios.TCIFLUSH)
+        except (OSError, termios.error):
+            pass
+
+
 def interactive(app, binary, args, address, env, updater=None):
     """Connect a native TUI through a per-client filter, leaving the router running."""
     with tempfile.TemporaryDirectory(prefix='cxx-', dir='/tmp') as directory:
@@ -189,6 +219,7 @@ def interactive(app, binary, args, address, env, updater=None):
             listener.settimeout(.2)
             upstream.connect(address)
             native = app.JsonSocket(upstream)
+            terminal_state = TerminalState(sys.stdin)
             child = subprocess.Popen([binary, '--remote', 'unix://' + local, *args], env=env)
             # The foreground terminal delivers SIGINT to both; let the TUI handle it.
             old = signal.signal(signal.SIGINT, lambda *_: None)
@@ -224,7 +255,15 @@ def interactive(app, binary, args, address, env, updater=None):
                                 terminal.send(message)
                 return child.returncode
             except EOFError:
-                return child.wait(timeout=5)
+                # A disconnected router must also disconnect the TUI before we
+                # wait: otherwise the TUI waits on us while we wait on the TUI.
+                if connection:
+                    connection.close()
+                    connection = None
+                try:
+                    return child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    raise app.Error('Connection closed, but Codex did not exit within 5 seconds.') from None
             finally:
                 if connection:
                     connection.close()
@@ -235,6 +274,7 @@ def interactive(app, binary, args, address, env, updater=None):
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.wait()
+                terminal_state.restore()
                 signal.signal(signal.SIGINT, old)
                 signal.signal(signal.SIGTERM, old_term)
                 if gate.current:

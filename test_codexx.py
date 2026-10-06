@@ -5,11 +5,16 @@ import importlib.util
 import io
 import json
 import os
+import pty
+import select
+import termios
+import tty
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -131,6 +136,57 @@ class CodexxTests(unittest.TestCase):
                 child.wait(timeout=10)
             if 'address' in locals():
                 Path(address).parent.rmdir()
+
+
+class DisconnectTests(unittest.TestCase):
+    def test_terminal_restore_recovers_raw_mode_and_disables_mouse(self):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        with os.fdopen(slave, 'wb', buffering=0) as stream:
+            original = termios.tcgetattr(slave)
+            state = cx.TerminalState(stream)
+            tty.setraw(slave)
+            state.restore()
+            self.assertEqual(termios.tcgetattr(slave), original)
+            self.assertTrue(select.select([master], [], [], 1)[0])
+            output = os.read(master, 4096)
+            self.assertIn(b'\x1b[?1003l', output)
+            self.assertIn(b'\x1b[?1006l', output)
+
+    def test_redirected_input_does_not_receive_terminal_escapes(self):
+        with tempfile.TemporaryFile() as stream:
+            cx.TerminalState(stream).restore()
+            stream.seek(0)
+            self.assertEqual(stream.read(), b'')
+
+    def test_router_eof_releases_terminal_before_waiting_for_exit(self):
+        app = cx.load_accounts()
+        with tempfile.TemporaryDirectory(prefix='cx-test-', dir='/tmp') as tmp:
+            root = Path(tmp)
+            address = str(root / 'router.sock')
+            fake = root / 'codex'
+            fake.write_text('#!' + sys.executable + '\n' + '''import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(12)
+s.connect(sys.argv[2].removeprefix('unix://'))
+s.sendall(b'GET / HTTP/1.1\\r\\nSec-WebSocket-Key: dGVzdA==\\r\\n\\r\\n')
+s.recv(4096)
+# A real TUI needs a transport disconnect before it can finish cleanup.
+while s.recv(4096): pass
+''')
+            fake.chmod(0o755)
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(address)
+                listener.listen(1)
+                def disconnect():
+                    peer, _ = listener.accept()
+                    peer.close()
+                worker = threading.Thread(target=disconnect)
+                worker.start()
+                try:
+                    self.assertEqual(cx.interactive(app, str(fake), [], address, os.environ.copy()), 0)
+                finally:
+                    worker.join(timeout=2)
 
 
 class InstallTests(unittest.TestCase):
