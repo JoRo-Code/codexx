@@ -3,11 +3,17 @@
 import argparse
 import ast
 import hashlib
+import importlib.machinery
+import importlib.util
 from pathlib import Path
 import subprocess
 import tempfile
 
-REPO = 'JoRo-Code/codex-account-switcher'
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import codexx_updates
+
+REPO = 'JoRo-Code/codexx'
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--notes-file', type=Path, required=True)
@@ -27,12 +33,20 @@ if git('rev-parse', tag + '^{commit}').strip() != git('rev-parse', 'HEAD').strip
     raise SystemExit('The version tag must point at HEAD. Push the tag before publishing.')
 with tempfile.TemporaryDirectory(prefix='codex-accounts-release-') as temp:
     directory = Path(temp)
+    # Validate the exact committed pair before making any release visible.
+    for name in codexx_updates.FILES:
+        (directory / name).write_bytes(git('show', 'HEAD:' + name))
+    loader = importlib.machinery.SourceFileLoader('release_engine', str(directory / 'codex-accounts'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    engine = importlib.util.module_from_spec(spec)
+    loader.exec_module(engine)
+    codexx_updates.validate(directory, engine)
     binary = directory / 'codex-accounts'
     binary.write_bytes(source)
     checksum = directory / 'codex-accounts.sha256'
     checksum.write_text(hashlib.sha256(source).hexdigest() + '  codex-accounts\n')
-    archive = directory / ('codex-account-switcher-' + version + '.tar.gz')
-    subprocess.run(['git', 'archive', '--format=tar.gz', '--prefix=codex-account-switcher-' + version + '/',
+    archive = directory / ('codexx-' + version + '.tar.gz')
+    subprocess.run(['git', 'archive', '--format=tar.gz', '--prefix=codexx-' + version + '/',
                     '-o', str(archive), tag], cwd=root, check=True)
     archive_checksum = directory / (archive.name + '.sha256')
     archive_checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')

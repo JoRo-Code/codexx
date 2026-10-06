@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Codex-compatible entry point using the existing codex-accounts installation."""
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import socket
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def load_accounts():
+    sibling = Path(__file__).resolve().with_name('codex-accounts')
+    path = sibling if sibling.is_file() else shutil.which('codex-accounts')
+    if not path:
+        raise RuntimeError('Install codex-accounts alongside codexx first.')
+    loader = importlib.machinery.SourceFileLoader('codexx_accounts', str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    app = importlib.util.module_from_spec(spec)
+    loader.exec_module(app)
+    return app
+
+
+def native_syntax(binary):
+    """Discover root commands and value flags from the installed CLI, not a frozen copy."""
+    result = subprocess.run([binary, '--help'], capture_output=True, text=True, check=True)
+    commands, values = set(), set()
+    in_commands = False
+    for line in result.stdout.splitlines():
+        if line == 'Commands:':
+            in_commands = True
+            continue
+        if line and not line.startswith(' '):
+            in_commands = False
+        if in_commands:
+            match = re.match(r'  ([a-z][\w-]*)\s', line)
+            if match:
+                commands.add(match[1])
+            alias = re.search(r'\[aliases: ([^]]+)\]', line)
+            if alias:
+                commands.update(x.strip() for x in alias[1].split(','))
+        if re.match(r'\s+-', line) and '<' in line:
+            values.update(re.findall(r'(?<!\w)--?[\w-]+', line.split('<')[0]))
+    return commands, values
+
+
+def positionals(args, value_flags):
+    result = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == '--':
+            result.extend(range(index + 1, len(args)))
+            break
+        if arg in value_flags:
+            index += 2
+            continue
+        if not arg.startswith('-') or arg == '-':
+            result.append(index)
+        index += 1
+    return result
+
+
+def has_flag(args, *flags):
+    before_separator = args[:args.index('--')] if '--' in args else args
+    return any(arg.split('=', 1)[0] in flags for arg in before_separator)
+
+
+def working_directory(args):
+    cwd = os.getcwd()
+    for i, arg in enumerate(args):
+        if arg == '--':
+            break
+        if arg in ('-C', '--cd') and i + 1 < len(args):
+            cwd = args[i + 1]
+        elif arg.startswith('--cd='):
+            cwd = arg.split('=', 1)[1]
+        elif arg.startswith('-C') and len(arg) > 2:
+            cwd = arg[2:]
+    return str(Path(cwd).expanduser().resolve())
+
+
+def reachable(address):
+    try:
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.settimeout(.3)
+            probe.connect(str(address))
+        return True
+    except OSError:
+        return False
+
+
+def router_address(app):
+    """Reuse Desktop's router first. Never stop or replace a running service."""
+    settings = app.read_json(app.ROOT / 'desktop/settings.json', {})
+    existing = settings.get('socket')
+    if existing and reachable(existing):
+        return existing
+    digest = hashlib.sha256(str(app.ROOT).encode()).hexdigest()[:12]
+    directory = Path('/tmp') / ('codexx-' + str(os.getuid()) + '-' + digest)
+    # Do not chmod or follow someone else's pre-existing path.
+    if directory.is_symlink():
+        raise app.Error('Unsafe router directory: ' + str(directory))
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise app.Error('Router directory must be private and owned by you: ' + str(directory))
+    address = str(directory / 'router.sock')
+    with app.lock('codexx-router-start'):
+        if reachable(address):
+            return address
+        if not app.eligible_accounts():
+            raise app.Error('No accounts are ready. Run codexx accounts setup or check codexx accounts status.')
+        log = app.ROOT / 'codexx-router.log'
+        with log.open('ab') as output:
+            child = subprocess.Popen(
+                [sys.executable, app.__file__, 'serve', '--socket', address],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                start_new_session=True,
+                env=dict(os.environ, CODEX_ACCOUNTS_HOME=str(app.ROOT), CODEX_ACCOUNTS_BINARY=app.BINARY))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if reachable(address):
+                return address
+            if child.poll() is not None:
+                break
+            time.sleep(.05)
+        raise app.Error('Router did not become ready. See ' + str(log))
+
+
+class ChatFilter:
+    """The shared Desktop router broadcasts notifications; a TUI needs its own chats."""
+    def __init__(self):
+        self.threads = set()
+        self.requests = {}
+        self.current = None
+        self.cwd = os.getcwd()
+
+    def from_client(self, message):
+        method = message.get('method')
+        params = message.get('params') or {}
+        if method == 'thread/start' and not params.get('cwd'):
+            params['cwd'] = self.cwd
+            message['params'] = params
+        if method and 'id' in message:
+            self.requests[json.dumps(message['id'])] = method
+        if method == 'thread/resume' and params.get('threadId'):
+            self.threads.add(params['threadId'])
+
+    def accepts(self, message):
+        method = message.get('method')
+        if not method:
+            original = self.requests.pop(json.dumps(message.get('id')), None)
+            thread = (message.get('result') or {}).get('thread')
+            if original in ('thread/start', 'thread/resume', 'thread/fork') and thread:
+                self.threads.add(thread['id'])
+                if not thread.get('ephemeral'):
+                    self.current = thread['id']
+            return True
+        params = message.get('params') or {}
+        thread = params.get('thread') or {}
+        sid = params.get('threadId') or params.get('thread_id') or params.get('conversationId') or thread.get('id')
+        if method.startswith('codex/event/'):
+            sid = sid or params.get('conversation_id')
+            # Legacy notifications are redundant with v2 and may lack ownership.
+            if not sid:
+                return False
+        if sid:
+            return sid in self.threads
+        # Never show an unscoped approval/tool request from another client.
+        return 'id' not in message
+
+
+def interactive(app, binary, args, address, env, updater=None):
+    """Connect a native TUI through a per-client filter, leaving the router running."""
+    with tempfile.TemporaryDirectory(prefix='cxx-', dir='/tmp') as directory:
+        local = str(Path(directory) / 'tui.sock')
+        with socket.socket(socket.AF_UNIX) as listener, socket.socket(socket.AF_UNIX) as upstream:
+            listener.bind(local)
+            listener.listen(1)
+            listener.settimeout(.2)
+            upstream.connect(address)
+            native = app.JsonSocket(upstream)
+            child = subprocess.Popen([binary, '--remote', 'unix://' + local, *args], env=env)
+            # The foreground terminal delivers SIGINT to both; let the TUI handle it.
+            old = signal.signal(signal.SIGINT, lambda *_: None)
+            old_term = signal.signal(signal.SIGTERM, lambda *_: child.terminate())
+            connection = None
+            gate = ChatFilter()
+            gate.cwd = working_directory(args)
+            try:
+                deadline = time.monotonic() + 30
+                while child.poll() is None and time.monotonic() < deadline:
+                    try:
+                        connection, _ = listener.accept()
+                        break
+                    except socket.timeout:
+                        pass
+                if connection is None:
+                    if child.poll() is not None:
+                        return child.returncode
+                    raise app.Error('Codex terminal did not connect within 30 seconds.')
+                connection.settimeout(5)
+                terminal = app.WebSocket(connection)
+                while child.poll() is None:
+                    if updater is not None:
+                        updater.refresh()
+                    ready, _, _ = select.select([connection, upstream], [], [], .2)
+                    if connection in ready:
+                        for message in terminal.read():
+                            gate.from_client(message)
+                            native.send(message)
+                    if upstream in ready:
+                        for message in native.read():
+                            if gate.accepts(message):
+                                terminal.send(message)
+                return child.returncode
+            except EOFError:
+                return child.wait(timeout=5)
+            finally:
+                if connection:
+                    connection.close()
+                if child.poll() is None:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
+                signal.signal(signal.SIGINT, old)
+                signal.signal(signal.SIGTERM, old_term)
+                if gate.current:
+                    print('Reconnect through the shared router: codexx resume ' + gate.current,
+                          file=sys.stderr, flush=True)
+
+
+def native_account(app, args, command_index, value_flags):
+    """Resolve saved exec conversations before selecting a new execution account."""
+    override = os.environ.get('CODEXX_ACCOUNT')
+    if override:
+        app.require_account(override)
+    tail = args[command_index + 1:]
+    flags = value_flags | {'--output-schema', '--color', '-o', '--output-last-message', '--thread-source'}
+    positions = positionals(tail, flags)
+    if args[command_index] in ('exec', 'e') and positions and tail[positions[0]] in ('resume', 'fork'):
+        rows = app.session_records(override)
+        if has_flag(tail, '--last'):
+            if not has_flag(tail, '--all'):
+                cwd = Path(working_directory(args))
+                rows = [row for row in rows if Path(row['cwd']).resolve() == cwd]
+            if not rows:
+                raise app.Error('No saved chat matches this directory; try --all or an explicit session ID.')
+            row = rows[0]
+            # Replace --last with the resolved ID so native selection cannot drift.
+            args = list(args)
+            args.insert(command_index + 2 + positions[0], row['id'])
+            args.remove('--last')
+            return row['account'], args
+        if len(positions) > 1:
+            query = tail[positions[1]]
+            matches = [r for r in rows if r['id'].startswith(query) or r['title'] == query]
+            if len(matches) != 1:
+                raise app.Error('Session must uniquely match a saved chat; use codexx accounts sessions.')
+            row = matches[0]
+            args = list(args)
+            args[command_index + 1 + positions[1]] = row['id']
+            return row['account'], args
+    if override:
+        return override, args
+    choices = app.eligible_accounts()
+    if not choices:
+        raise app.Error('No accounts are ready. Run codexx accounts setup or check codexx accounts status.')
+    return choices[0], args
+
+
+def main(args=None):
+    args = list(sys.argv[1:] if args is None else args)
+    app = load_accounts()
+    os.umask(0o077)
+    if args == ['--bundle-version']:
+        print(app.VERSION)
+        return 0
+    if args[:1] == ['update']:
+        import codexx_updates
+        return codexx_updates.main(app, args[1:])
+    if args[:1] == ['native']:
+        binary = shutil.which(app.BINARY)
+        if not binary: raise app.Error('Codex CLI was not found on PATH.')
+        os.execv(binary, [binary, *args[1:]])
+    if args[:1] == ['accounts']:
+        tail = args[1:]
+        if tail[:2] == ['desktop', 'setup']:
+            tail = ['setup', *tail[2:]]
+        os.execv(sys.executable, [sys.executable, app.__file__, *(tail or ['--help'])])
+    binary = shutil.which(app.BINARY)
+    if not binary:
+        raise app.Error('Codex CLI was not found on PATH. Install Codex first.')
+    commands, values = native_syntax(binary)
+    positions = positionals(args, values)
+    first = positions[0] if positions else None
+    command = args[first] if first is not None and args[first] in commands else None
+    if '--' in args and first is not None and first > args.index('--'):
+        command = None
+    if has_flag(args, '-h', '--help') or command == 'help':
+        result = subprocess.run([binary, *args])
+        if command in (None, 'help'):
+            print('\ncodexx: automatic account routing for interactive chats and resume/fork.')
+            print('  codexx accounts setup          Open account management in your browser')
+            print('  codexx accounts --help         Account administration')
+            print('  codexx update                 Update the complete Codexx bundle')
+            print('  codexx update all sessions    Request safe adoption; never restart chats')
+            print('  codexx update status          Show current/pending/legacy sessions')
+            print('  codexx native update          Update the underlying official Codex CLI')
+            print('exec/review use one account without automatic failover; CODEXX_ACCOUNT selects it.')
+        return result.returncode
+    if has_flag(args, '-V', '--version'):
+        print('codexx (codex-accounts ' + app.VERSION + ')', flush=True)
+        os.execv(binary, [binary, *args])
+    updater = app.LiveRuntime()
+    updater.check_update()
+    # Respect an explicitly selected transport or local model. Native utility,
+    # auth and configuration commands retain Codex's own home and behavior.
+    if has_flag(args, '--remote', '--oss', '--local-provider'):
+        os.execv(binary, [binary, *args])
+    if command in ('exec', 'e', 'review'):
+        account, args = native_account(app, args, first, values)
+        env = app.environment(account)
+        # Put defaults before user arguments: native flags and -c overrides win.
+        runtime = app.command()
+        # Keep the pinned package entry point as well as its defaults, so lazy
+        # tool helpers survive removal of the original package during updates.
+        executable = shutil.which(runtime[0]) or runtime[0]
+        os.execve(executable, [*runtime, *args], env)
+    if command is not None and command not in ('resume', 'fork'):
+        os.execv(binary, [binary, *args])
+    if not sys.stdin.isatty():
+        raise app.Error('Run codexx in a terminal, or use codexx exec for non-interactive work.')
+    address = router_address(app)
+    env = os.environ.copy()
+    for name in app.AUTH_ENV:
+        env.pop(name, None)
+    # No credentials/config/history are copied. The existing router owns these.
+    print('codexx · automatic account routing', file=sys.stderr, flush=True)
+    return interactive(app, binary, args, address, env, updater)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        print('codexx: ' + str(exc), file=sys.stderr)
+        sys.exit(1)

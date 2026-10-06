@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sqlite3
+import shutil
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,52 @@ class LauncherTests(unittest.TestCase):
     def quiet_move(self, row, target):
         with contextlib.redirect_stdout(io.StringIO()):
             app.move(row, target)
+
+    def test_packaged_runtime_survives_upgrade_and_new_accounts_use_new_release(self):
+        source = app.ROOT / 'installed' / 'v1'
+        (source / 'bin').mkdir(parents=True)
+        (source / 'codex-package.json').write_text(json.dumps({
+            'layoutVersion': 1, 'entrypoint': 'bin/codex'}))
+        binary = source / 'bin/codex'
+        binary.write_text('#!/bin/sh\nread ready\nexec "$(dirname "$0")/codex-code-mode-host"\n')
+        binary.chmod(0o700)
+        helper = source / 'bin/codex-code-mode-host'
+        helper.write_text('#!/bin/sh\necho original-helper\n')
+        helper.chmod(0o700)
+        (source / 'codex-resources').mkdir()
+        (source / 'codex-resources/data').write_text('resource')
+        link = app.ROOT / 'codex'
+        link.symlink_to(binary)
+        with patch.object(app, 'BINARY', str(link)):
+            pinned = app.command('app-server')[0]
+            self.assertEqual(app.command('resume', self.sid)[0], pinned)
+            running = subprocess.Popen([pinned], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            self.addCleanup(lambda: running.poll() is None and running.kill())
+            replacement = source.with_name('v2')
+            shutil.copytree(source, replacement)
+            (replacement / 'bin/codex-code-mode-host').write_text('#!/bin/sh\necho new-helper\n')
+            link.unlink()
+            link.symlink_to(replacement / 'bin/codex')
+            shutil.rmtree(source)
+            self.assertEqual(running.communicate('continue\n', timeout=5)[0].strip(), 'original-helper')
+            fresh = app.command('app-server')[0]
+            self.assertNotEqual(fresh, pinned)
+            for account in ('personal', 'work'):
+                result = subprocess.run([fresh], input='continue\n', env=app.environment(account),
+                                        text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout.strip(), 'new-helper')
+            self.assertEqual((Path(pinned).parent.parent / 'codex-resources/data').read_text(), 'resource')
+
+    def test_failed_runtime_capture_is_not_published(self):
+        source = app.ROOT / 'installed'
+        (source / 'bin').mkdir(parents=True)
+        (source / 'codex-package.json').write_text('{"layoutVersion":1,"entrypoint":"bin/codex"}')
+        binary = source / 'bin/codex'
+        binary.write_text('#!/bin/sh\n')
+        binary.chmod(0o700)
+        with patch.object(app, 'BINARY', str(binary)), patch.object(app.shutil, 'copytree', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError): app.command('app-server')
+        self.assertEqual([p.name for p in (app.ROOT / 'native-runtimes').iterdir()], ['.lock'])
 
     def test_environment_isolates_accounts_and_removes_ambient_auth(self):
         with patch.dict(os.environ, {'OPENAI_API_KEY':'secret', 'CODEX_THREAD_ID':'existing', 'CODEX_HOME':'old'}):
