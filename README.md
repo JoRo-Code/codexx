@@ -6,6 +6,8 @@ Codexx is a local launcher for multiple ChatGPT accounts in Codex CLI. Automatic
 
 > **Experimental:** simulated failover and offline compatibility checks pass. Live quota failover has not yet been validated.
 
+**Start here:** [Step-by-step installation](#install) · [CLI](#cli-start-your-first-chat) · [Desktop](#set-up-native-codex-desktop-macos) · [Updates](#bundle-installation-and-safe-updates)
+
 ## Use `codexx` as your daily CLI
 
 `codexx` opens the native Codex terminal with automatic account routing. It uses the
@@ -39,7 +41,6 @@ codexx accounts add work
 codexx accounts status
 codexx accounts overview --history
 codexx accounts routing --threshold 95
-codexx accounts add work               # Add an account directly from the CLI
 codexx accounts update                # Also updates the bundle after migration
 ```
 
@@ -121,17 +122,17 @@ native backends keep their original preserved tool runtime. The existing
 
 ## Set up native Codex Desktop (macOS)
 
-After installing, run:
+Complete [installation](#install) first. Desktop integration is optional and currently packaged for **macOS only**. The account web app also currently requires macOS; Linux users can add accounts in the CLI.
 
-```sh
-codex-accounts setup
-```
+1. Install and open the desktop app using [OpenAI's desktop installation page](https://learn.chatgpt.com/docs/app), then sign in. Codexx does not install the desktop app for you.
+2. In Terminal, run `codexx accounts setup`. This opens the local account management web app.
+3. Choose **Add account** and finish ChatGPT sign-in in your browser. Repeat for additional accounts. If your accounts are already listed, reuse them.
+4. Under **Desktop connection**, click **Connect**. Wait for the local connection to report ready. Existing running services and accounts are retained.
+5. In the desktop app, open **Settings → Connections → SSH → Add**. Use the hostname shown by the web app, normally `codex-auto`. Leave port and identity blank; the generated SSH configuration supplies them. If that connection is already present, select it instead of adding a duplicate.
+6. Add a project folder **on that connection**, then start a new Codex chat in that project. An ordinary local project does not use Codexx routing. The names of desktop settings can vary by app version; the app must support SSH connections.
+7. Return to the web app to see the chat and account activity. You can also check the local services with `codexx accounts desktop status`.
 
-This opens a private setup page in your browser:
-
-1. **Add account** opens ChatGPT sign-in. Repeat for each account; labels are optional.
-2. **Connect** configures and checks the local SSH connection and background services.
-3. Follow the short **Finish in Codex Desktop** card once to link the connection and add a project on it.
+**Ready means the local services are available.** You still need to select the connection and its project in Desktop. Existing chats keep their original connection; they are not moved automatically. You can close the setup page after connecting.
 
 The page shows account usage, searchable chats with their account and observed state, and an activity feed with automatic switches. Activity refreshes every 10 seconds; quota refreshes every minute while the page is open. Usage snapshots are retained locally for 30 days (latest 100 displayed), and the feed displays the latest 200 recorded events. Quota snapshots are account totals, not per-chat billing. Chats outside the launcher/managed Desktop connection are not monitored. PID reuse is excluded from connected-chat indicators.
 
@@ -189,28 +190,112 @@ Since v0.7.1, temporary helper threads cannot replace the main chat’s tracking
 
 ## Install
 
-The repository is now `JoRo-Code/codexx`. Existing account data remains under
-`~/.local/share/codex-accounts`, and `codex-accounts` remains a supported command.
-For an older standalone installation, run this installer once from the renamed
-repository to adopt the new update location and bundle installation.
+Choose **CLI only** (macOS or Linux), **Desktop** (macOS), or both. They share the same accounts and local data. CLI use does not require the desktop app or its Connect button. Native Windows installation is not packaged.
 
-Requires macOS or Linux, Python 3.9+, and a Codex CLI supporting `--remote unix://` and the app-server protocol (transport and paginated migration checked against installed Codex 0.159.2). Manual mode also uses `--no-daemon`. Automatic mode depends on an experimental Codex interface, so rerun the tests after CLI upgrades.
+### 1. Check prerequisites
+
+Open Terminal. You need Python 3.9+, Git, and the official Codex CLI:
 
 ```sh
-git clone https://github.com/JoRo-Code/codexx.git
+python3 --version
+git --version
+codex --version
+```
+
+If a command is missing, install it before continuing. On macOS with Homebrew, `brew install python git` supplies Python and Git. With Node.js/npm installed, install Codex using:
+
+```sh
+npm install -g @openai/codex@latest
+codex --version
+```
+
+See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [official npm installation example](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex). Desktop users need the CLI too, because it runs the local backend. Codexx requires Codex's experimental `--remote unix://` and app-server interfaces; this release was locally checked with Codex 0.160.1.
+
+### 2. Download and install Codexx
+
+For the published v0.13.0 release:
+
+```sh
+git clone --branch v0.13.0 --depth 1 https://github.com/JoRo-Code/codexx.git
 cd codexx
 python3 install.py
 ```
 
-Or download and extract the source archive from [Releases](https://github.com/JoRo-Code/codexx/releases), then run `python3 install.py` inside the extracted directory. GitHub downloads do not require a GitHub account.
+Alternatively, download `codexx-0.13.0.tar.gz` from [v0.13.0 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.13.0), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
 
-If the installer reports that `~/.local/bin` is missing from your PATH, add this to your shell configuration and open a new terminal:
+Already using `codex-accounts`? Run the same installer once. It retains accounts, history, settings and running services under `~/.local/share/codex-accounts`. You do not need to sign in again or restart existing chats. The old command remains supported. Already using a versioned Codexx installation? Use `codexx update` instead.
+
+### 3. Make the command available
+
+Run this in your current terminal:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
+codexx --bundle-version
 ```
 
-The installer creates the versioned bundle and the `codexx`/`codex-accounts` entry points under `~/.local/bin`. It does not modify shell settings, your existing Codex login, or your default Codex configuration.
+It should print `0.13.0` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
+
+### 4. Connect your accounts
+
+On **macOS**, open the web app:
+
+```sh
+codexx accounts setup
+```
+
+Click **Add account**, finish ChatGPT sign-in, and wait for the account to appear. Repeat for each account you want to use. CLI-only users can leave **Desktop connection → Connect** untouched.
+
+On **Linux**, or if you prefer terminal commands, add each account directly:
+
+```sh
+codexx accounts add personal
+codexx accounts add work
+```
+
+Use distinct labels and select the intended ChatGPT account during each sign-in. Skip this step for accounts already connected. Confirm the result:
+
+```sh
+codexx accounts status
+```
+
+### CLI: start your first chat
+
+Change into your own project directory (replace the example path), then start:
+
+```sh
+cd /path/to/your/project
+codexx
+```
+
+You now have the native Codex terminal with automatic account routing. To continue later, run `codexx resume` or `codexx resume --last`. Use `codexx accounts setup` on macOS to reopen account usage and chat activity. `exec` and `review` use a single account per invocation; automatic failover applies to interactive chats.
+
+### Desktop: finish connecting
+
+Follow [Set up native Codex Desktop](#set-up-native-codex-desktop-macos) above to connect the app to the same accounts. You can keep CLI chats running while setting this up.
+
+### Keep it updated
+
+```sh
+codexx update
+codexx update all sessions
+codexx update status --json
+```
+
+The first command installs the latest published bundle. The second asks compatible running sessions to adopt the installed engine when idle; it never forces a restart. Legacy sessions may report `restart_required`: leave their work running and reopen them individually when convenient. New terminal invocations use the installed bundle. An already-open setup page must be reopened with `codexx accounts setup` to show new UI changes.
+
+Automatic release checks are enabled by default. See [safe updates](#bundle-installation-and-safe-updates) for update policy and rollback.
+
+### If something does not work
+
+| Symptom | What to do |
+| --- | --- |
+| `codexx: command not found` | Run the PATH export in step 3, or try `~/.local/bin/codexx --bundle-version`. |
+| Installer cannot find `codex` | Install the official CLI, then ensure `codex --version` works in this terminal. |
+| No connected accounts | Run `codexx accounts status`, then add an account using step 4. |
+| Setup does not open on Linux | The web app is currently macOS-only. Use `codexx accounts add NAME` and `codexx accounts status`. |
+| Desktop shows no routed chat | Check `codexx accounts desktop status` and select a project on the `codex-auto` SSH connection. Local readiness alone does not link Desktop. |
+| Existing setup page still looks old | Open a new one using `codexx accounts setup`; reloading the old page uses its existing server. |
 
 ## Update without reinstalling
 
