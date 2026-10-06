@@ -1,5 +1,7 @@
 # Codexx
 
+<img src="assets/codexx.svg" width="96" height="96" alt="Codexx icon">
+
 Codexx is a local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keeps the native Codex terminal open and reconnects a quota-failed conversation under another connected account. Each account has its own login and conversation state; configuration and capabilities can be shared across accounts. Multiple terminal sessions can use different accounts simultaneously. No external router, API key, or Python packages are required. The local bridge forwards terminal protocol messages to the official Codex app-server; model traffic goes directly from Codex to OpenAI.
 
 > **Experimental:** simulated failover and offline compatibility checks pass. Live quota failover has not yet been validated.

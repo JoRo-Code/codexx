@@ -2929,10 +2929,19 @@ def desktop_proxy(args):
 
 # The setup page has no external assets. Its capability lives in the URL fragment,
 # never in HTTP logs, and every API request requires it plus a loopback Host.
-SETUP_HTML = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Accounts</title>
+# Embedded so installed bundles do not depend on a separate asset directory.
+CODEXX_ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <rect x="1" y="1" width="126" height="126" rx="31" fill="white" stroke="#e2e2e2"/>
+  <g stroke="#090909" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="64" cy="64" r="30"/>
+    <path d="m52 56 5 8-5 8m15 0h10"/>
+  </g>
+</svg>'''
+
+SETUP_HTML = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codexx</title><link rel="icon" type="image/svg+xml" href="__CODEXX_ICON__">
 <style>
-:root{font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#202b29;background:#f4f6f3}*{box-sizing:border-box}body{margin:0}main{max-width:980px;margin:64px auto;padding:0 24px}header{margin-bottom:32px}.eyebrow{font-size:12px;letter-spacing:2px;font-weight:700;color:#587267}h1{font-size:40px;letter-spacing:-1.6px;margin:12px 0}h2{font-size:20px;margin:0}p{line-height:1.6;color:#60706a}.card{background:white;border:1px solid #dce4dc;border-radius:20px;padding:26px;margin:18px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.account{padding:16px 0;border-bottom:1px solid #edf0eb}.account:last-child{border:0}.muted,small{color:#66776e;font-size:14px}button{border:0;border-radius:10px;padding:12px 18px;background:#17664b;color:white;font:inherit;font-weight:600;cursor:pointer}button.secondary{background:#eef3ec;color:#315445}button:disabled{opacity:.5;cursor:default}input{font:inherit;border:1px solid #ccd7ce;border-radius:10px;padding:12px;width:100%;margin:12px 0}.badge{font-size:12px;background:#eef3ec;padding:6px 10px;border-radius:20px;white-space:nowrap}#message{padding:14px 18px;line-height:1.5;background:#e8eee7;border-radius:12px;position:sticky;top:12px;z-index:1}#message:empty{display:none}#message.error{color:#a3312a}code{background:#eef3ec;padding:5px 9px;border-radius:6px}details{margin-top:16px}li{margin:14px 0;line-height:1.5}.entry{padding:16px 0;border-bottom:1px solid #edf0eb;overflow-wrap:anywhere}.entry p{margin:7px 0}.entries{max-height:440px;overflow:auto}select{font:inherit;padding:8px;border:1px solid #ccd7ce;border-radius:8px;background:white}summary{cursor:pointer}footer{font-size:13px;color:#718078;line-height:1.6;margin:26px 0}a{color:#17664b}@media(max-width:500px){main{margin:28px auto}h1{font-size:32px}.card{padding:20px}.row{flex-wrap:wrap}}
-</style><main><header><div class="eyebrow">CODEX ACCOUNTS</div><h1>Your Codex activity.</h1><p>See which account each chat uses, follow automatic switches, and keep an eye on your limits.</p></header><div id="message" role="status" aria-live="polite"></div>
+:root{font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#202b29;background:#f4f6f3}*{box-sizing:border-box}body{margin:0}main{max-width:980px;margin:64px auto;padding:0 24px}header{margin-bottom:32px}.brand{display:flex;align-items:center;gap:14px}.brand img{width:56px;height:56px;box-shadow:0 6px 20px #0000000a;border-radius:14px}.eyebrow{font-size:12px;letter-spacing:2px;font-weight:700;color:#587267}h1{font-size:40px;letter-spacing:-1.6px;margin:12px 0}h2{font-size:20px;margin:0}p{line-height:1.6;color:#60706a}.card{background:white;border:1px solid #dce4dc;border-radius:20px;padding:26px;margin:18px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.account{padding:16px 0;border-bottom:1px solid #edf0eb}.account:last-child{border:0}.muted,small{color:#66776e;font-size:14px}button{border:0;border-radius:10px;padding:12px 18px;background:#17664b;color:white;font:inherit;font-weight:600;cursor:pointer}button.secondary{background:#eef3ec;color:#315445}button:disabled{opacity:.5;cursor:default}input{font:inherit;border:1px solid #ccd7ce;border-radius:10px;padding:12px;width:100%;margin:12px 0}.badge{font-size:12px;background:#eef3ec;padding:6px 10px;border-radius:20px;white-space:nowrap}#message{padding:14px 18px;line-height:1.5;background:#e8eee7;border-radius:12px;position:sticky;top:12px;z-index:1}#message:empty{display:none}#message.error{color:#a3312a}code{background:#eef3ec;padding:5px 9px;border-radius:6px}details{margin-top:16px}li{margin:14px 0;line-height:1.5}.entry{padding:16px 0;border-bottom:1px solid #edf0eb;overflow-wrap:anywhere}.entry p{margin:7px 0}.entries{max-height:440px;overflow:auto}select{font:inherit;padding:8px;border:1px solid #ccd7ce;border-radius:8px;background:white}summary{cursor:pointer}footer{font-size:13px;color:#718078;line-height:1.6;margin:26px 0}a{color:#17664b}@media(max-width:500px){main{margin:28px auto}h1{font-size:32px}.card{padding:20px}.row{flex-wrap:wrap}}
+</style><main><header><div class="brand"><img src="__CODEXX_ICON__" width="56" height="56" alt=""><div class="eyebrow">CODEXX</div></div><h1>Your Codex activity.</h1><p>See which account each chat uses, follow automatic switches, and keep an eye on your limits.</p></header><div id="message" role="status" aria-live="polite"></div>
 <section class="card"><div class="row"><h2>Accounts & usage</h2><button class="secondary" id="refresh">Refresh usage</button></div><div id="accounts"><p>Loading your accounts…</p></div><p class="muted" id="usage-time"></p><details><summary>Add another account</summary><form id="addform"><label for="label">Account label <small>(optional)</small></label><input id="label" maxlength="40" placeholder="e.g. Personal or Work" autocomplete="off"><button id="add">Add account</button></form><p class="muted">Sign in with the account you want to add in the browser that opens.</p></details></section>
 <section class="card"><div class="row"><h2>Chats</h2><span id="chat-count" class="badge">Loading…</span></div><input id="chat-search" type="search" placeholder="Search chats, projects or accounts" aria-label="Search chats"><label><input id="live-only" type="checkbox" style="width:auto;margin-right:8px">Connected only</label><div class="entries" id="chats"></div><p class="muted" id="coverage"></p></section>
 <section class="card"><div class="row"><h2>Activity</h2><select id="event-filter" aria-label="Activity filter"><option value="all">All activity</option><option value="switches">Account switches</option></select></div><p class="muted">Latest 200 recorded events. Times are local to this browser.</p><div class="entries" id="events"></div></section>
@@ -2959,6 +2968,7 @@ pollActivity();setInterval(pollActivity,10000);
 
 poll();setInterval(poll,2500);
 </script></html>'''
+SETUP_HTML = SETUP_HTML.replace('__CODEXX_ICON__', 'data:image/svg+xml,' + urllib.parse.quote(CODEXX_ICON_SVG, safe=''))
 
 
 def save_usage_observations(reports):
@@ -3114,7 +3124,7 @@ def setup_http_server(window):
             self.send_header('Cache-Control','no-store')
             self.send_header('X-Content-Type-Options','nosniff')
             self.send_header('Referrer-Policy','no-referrer')
-            self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            self.send_header('Content-Security-Policy',"default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
             self.end_headers();self.wfile.write(body)
         def allowed(self,auth=True):
             host='127.0.0.1:'+str(self.server.server_port)
