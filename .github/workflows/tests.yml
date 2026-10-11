@@ -27,4 +27,5 @@ jobs:
       - run: python test_router.py
       - run: python test_onboarding.py
       - run: python test_setup_window.py
+      - run: python test_refresh.py
       - run: python codex-accounts --help

@@ -337,6 +337,31 @@ Each `add` runs the official Codex browser login. Select the correct ChatGPT acc
 
 `list` asks each account’s Codex backend for its cached email and plan, so you can identify which ChatGPT login each label represents. It does not refresh tokens or verify remaining quota. If an identity cannot be read, that row says `identity unavailable`; other accounts still appear.
 
+To renew a saved login without opening the browser, run:
+
+```sh
+codexx accounts refresh codex5
+# Equivalent: codex-accounts refresh codex5
+```
+
+The account management page also has a **Refresh access token** button per account.
+This requests a forced refresh through the official Codex app-server
+(`account/read` with `refreshToken: true`), then verifies live access by fetching
+usage limits. Codex saves rotated credentials in the selected account's home;
+token values are never displayed by the launcher. Explicit refreshes for the
+same account are serialized, and running chats remain open. Ordinary status
+polling does not force token rotation. A revoked or expired refresh token may
+require a new browser sign-in; a failed verification never reports success.
+
+In `codexx accounts setup`, each account has **Refresh access token** and
+**Sign in again** buttons. Use **Sign in again** when its refresh token was
+revoked or the saved login no longer works. Chats can stay open during
+reconnection. Select the same ChatGPT account and workspace in the browser;
+credentials for a different identity are rejected before replacement. The existing credentials remain in place until the new sign-in
+succeeds; cancellation or failure preserves them and all chat history.
+The terminal equivalent is `codexx accounts login codex5`.
+See the [official app-server authentication documentation](https://developers.openai.com/codex/app-server/).
+
 Credentials remain local under `~/.local/share/codex-accounts/accounts/NAME/auth.json`. They are stored with private permissions, and Codex performs its own token refresh. Account names are labels you choose; they do not verify the identity you select in the browser. `status NAME` fetches live usage limits and shows launcher sessions for that account; `status` without a name shows all accounts.
 
 ## Account dashboard

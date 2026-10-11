@@ -51,6 +51,21 @@ class WindowTests(unittest.TestCase):
         app.setup_server_record().write_text('not json')
         self.assertIsNone(app.existing_setup_server())
 
+    def test_changed_ui_does_not_reuse_same_release_server(self):
+        server=self.server()
+        record={'port':server.server_port,'token':self.window.token}
+        app.atomic_json(app.setup_server_record(),record)
+        old_path=app.setup_server_record()
+        old_key=app.setup_server_key()
+        self.assertEqual(app.existing_setup_server(),record)
+        with patch.object(app,'SETUP_HTML',app.SETUP_HTML+'<!-- local reinstall -->'):
+            self.assertNotEqual(app.setup_server_key(),old_key)
+            self.assertNotEqual(app.setup_server_record(),old_path)
+            self.assertIsNone(app.existing_setup_server())
+            with app.setup_start_lock():
+                self.assertTrue((app.ROOT/'locks'/('setup-start-'+app.setup_server_key()+'.lock')).exists())
+        self.assertEqual(app.existing_setup_server(),record)
+
     def test_options_are_authenticated_and_shared_without_interrupting_jobs(self):
         server=self.server();auth={'Authorization':'Bearer '+self.window.token}
         self.assertEqual(self.request(server,'/api/health')[0],403)
@@ -98,6 +113,61 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(popen.call_args[0][0][-2:],['add','account-1'])
         with patch.object(app.subprocess,'Popen') as popen:w.work('add','personal')
         popen.assert_not_called();self.assertTrue(w.job['error'])
+    def test_reconnect_uses_existing_label_and_browser_timeout(self):
+        w=app.SetupWindow()
+        before=(app.account_home('personal')/'auth.json').read_text()
+        with patch.object(app.subprocess,'Popen') as popen,patch.object(app,'collect_status',return_value=[]):
+            popen.return_value.wait.return_value=0
+            w.work('reconnect','personal')
+        self.assertEqual(popen.call_args[0][0][-2:],['login','personal'])
+        popen.return_value.wait.assert_called_once_with(timeout=600)
+        self.assertFalse(w.job['error'])
+        self.assertIn('sign-in renewed',w.job['message'])
+        self.assertEqual((app.account_home('personal')/'auth.json').read_text(),before)
+        with patch.object(app.subprocess,'Popen') as popen:
+            popen.return_value.wait.return_value=1
+            w.work('reconnect','personal')
+        self.assertTrue(w.job['error'])
+        self.assertIn('previous login was kept',w.job['message'])
+
+    def test_reconnect_allows_open_sessions_but_serializes_account_operations(self):
+        w=app.SetupWindow()
+        with patch.object(app.threading,'Thread') as thread:
+            for label in ('missing',''):
+                with self.assertRaises(app.Error):w.start('reconnect',label)
+            with app.lock('token-refresh-personal'),self.assertRaisesRegex(app.Error,'Another account operation'):
+                w.start('reconnect','personal')
+            thread.assert_not_called()
+        self.assertFalse(w.job['busy'])
+        with app.lock('account-work',shared=True),patch.object(app.threading,'Thread') as thread:
+            w.start('reconnect','work')
+        self.assertEqual(thread.call_args.kwargs['args'],('reconnect','work'))
+
+    def test_background_usage_poll_does_not_block_reconnect_or_erase_feedback(self):
+        w=app.SetupWindow()
+        with patch.object(app.threading,'Thread'):
+            w.start('refresh')
+            self.assertTrue(w.usage_busy)
+            self.assertFalse(w.job['busy'])
+            w.start('reconnect','personal')
+        message=w.job['message']
+        with patch.object(app,'collect_status',return_value=[]):
+            w.work('refresh','')
+        self.assertFalse(w.usage_busy)
+        self.assertTrue(w.job['busy'])
+        self.assertEqual(w.job['message'],message)
+        self.assertIn('accountRender!==lastAccountsRender',app.SETUP_HTML)
+
+    def test_reconnect_action_requires_web_authentication(self):
+        s=self.server()
+        body=json.dumps({'action':'reconnect','label':'personal'})
+        with patch.object(self.window,'start') as start:
+            self.assertEqual(self.request(s,'/api/action','POST',body=body)[0],403)
+            start.assert_not_called()
+            self.assertEqual(self.request(s,'/api/action','POST',{'Authorization':'Bearer '+self.window.token},body)[0],200)
+            start.assert_called_once_with('reconnect','personal')
+        self.assertIn("login.textContent='Sign in again'",app.SETUP_HTML)
+
     def test_activity_api_requires_authentication(self):
         server=self.server()
         self.assertEqual(self.request(server,'/api/activity')[0],403)

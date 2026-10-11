@@ -560,6 +560,19 @@ def guard_idle(row):
             raise Error('The conversation may still be running. Close the source CLI first. '
                         'New sessions on this account must also be closed before moving history.')
 
+def login_identity(auth):
+    """Compare native credential identities, without exposing token contents."""
+    tokens = (auth or {}).get('tokens') or {}
+    subject = None
+    try:
+        payload = tokens.get('id_token', '').split('.')[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        subject = claims.get('sub')
+    except (ValueError, IndexError, TypeError, AttributeError):
+        pass
+    return tokens.get('account_id'), subject
+
+
 def login(name, device=False, create=False):
     home = account_home(name)
     if create:
@@ -568,15 +581,32 @@ def login(name, device=False, create=False):
         private_dir(home)
     else:
         require_account(name)
-    with lock('account-' + name):
+    with lock('token-refresh-' + name), lock('account-' + name, shared=True):
         print(f'Connecting {name}. Select its ChatGPT account in the browser.', flush=True)
+        expected_identity = login_identity(read_json(home / 'auth.json'))
         args = ['login'] + (['--device-auth'] if device else [])
-        status = subprocess.call(command(*args), env=environment(name))
-        if status:
-            raise Error(f'Login did not finish (exit {status}). Retry: codex-accounts login {name}')
-        if not (home / 'auth.json').is_file():
-            raise Error('Codex did not save file-based credentials. Check managed authentication settings.')
-        (home / 'auth.json').chmod(0o600)
+        # An empty credential home forces a new sign-in without deleting the
+        # existing login. Publish only after success; cancellation preserves it.
+        staging_root = ROOT / 'login-staging'
+        private_dir(staging_root)
+        with tempfile.TemporaryDirectory(dir=staging_root) as temporary:
+            staged = Path(temporary)
+            env = environment(name)
+            env['CODEX_HOME'] = str(staged)
+            config = home / 'config.toml'
+            if config.is_file():
+                shutil.copyfile(config, staged / 'config.toml')
+                (staged / 'config.toml').chmod(0o600)
+            status = subprocess.call(command(*args), env=env)
+            if status:
+                raise Error(f'Login did not finish (exit {status}). Retry: codex-accounts login {name}')
+            auth = read_json(staged / 'auth.json')
+            if not isinstance(auth, dict) or not auth.get('tokens'):
+                raise Error('Codex did not save ChatGPT credentials. Retry the sign-in.')
+            actual_identity = login_identity(auth)
+            if any(expected and actual != expected for expected, actual in zip(expected_identity, actual_identity)):
+                raise Error('Choose the same ChatGPT account and workspace for ' + name + '. Your previous login was kept.')
+            atomic_json(home / 'auth.json', auth)
         print(f'Connected. Start with: codex-accounts run {name}')
 
 def run(name, row=None, prompt=None, cwd=None, model=None):
@@ -971,8 +1001,8 @@ def menu():
         list_accounts()
     return 0
 
-def account_snapshot(name, timeout=8, include_usage=False):
-    """Ask Codex for cached identity, without refreshing or exposing credentials."""
+def account_snapshot(name, timeout=8, include_usage=False, refresh_token=False):
+    """Ask Codex for identity; explicit refresh stays inside its credential manager."""
     with lock('account-' + name, shared=True):
         backend = Backend(name)
         deadline = time.monotonic() + timeout
@@ -983,7 +1013,8 @@ def account_snapshot(name, timeout=8, include_usage=False):
                     message = backend.messages.popleft()
                     if message.get('id') == ident:
                         if 'error' in message:
-                            raise Error('Account identity unavailable.')
+                            raise Error('Token refresh failed; retry or reconnect with: codex-accounts login ' + name
+                                        if refresh_token else 'Account identity unavailable.')
                         return message.get('result', {})
                 if select.select([backend.process.stdout], [], [], .1)[0]:
                     backend.read()
@@ -991,7 +1022,7 @@ def account_snapshot(name, timeout=8, include_usage=False):
         try:
             request(1, 'initialize', {'clientInfo': {'name': 'codex_accounts_identity', 'version': VERSION}})
             backend.send({'method': 'initialized'})
-            account = request(2, 'account/read', {'refreshToken': False}).get('account')
+            account = request(2, 'account/read', {'refreshToken': refresh_token}).get('account')
             report = dict(identity=('—', '—', 'needs login'), usage=None, usage_error=None, checked_at=time.time())
             if not account:
                 report['usage_error'] = 'No ChatGPT login'
@@ -1012,6 +1043,16 @@ def account_snapshot(name, timeout=8, include_usage=False):
             return report
         finally:
             backend.close()
+
+def refresh_account(name):
+    """Serialize explicit refreshes without taking the active session's writer lock."""
+    require_account(name)
+    with lock('token-refresh-' + name):
+        report = account_snapshot(name, timeout=45, include_usage=True, refresh_token=True)
+    if report['usage_error'] or report['usage'] is None:
+        raise Error('Could not verify access after token refresh. Check the connection; '
+                    'if access is still denied, reconnect with: codex-accounts login ' + name)
+    return report
 
 def account_identity(name, timeout=8):
     return account_snapshot(name, timeout=timeout)['identity']
@@ -1550,6 +1591,8 @@ def parser():
         s = sub.add_parser(action, help='Connect a ChatGPT account' if action == 'add' else 'Reconnect an account')
         s.add_argument('account')
         s.add_argument('--device-auth', action='store_true')
+    s = sub.add_parser('refresh', help='Refresh a ChatGPT access token and verify live access')
+    s.add_argument('account')
     sub.add_parser('list', help='Show accounts and running launcher processes')
     s = sub.add_parser('auto', help='Native Codex terminal with automatic account failover')
     s.add_argument('--account', help='Initial account; otherwise choose an available account')
@@ -1628,6 +1671,9 @@ def main(argv=None):
         return menu()
     if args.action in ('add', 'login'):
         login(args.account, args.device_auth, create=args.action == 'add')
+    elif args.action == 'refresh':
+        refresh_account(args.account)
+        print(args.account + ': token refresh completed and live access verified.')
     elif args.action == 'list':
         list_accounts()
     elif args.action == 'status':
@@ -2965,17 +3011,17 @@ python3 install.py
 export PATH="$HOME/.local/bin:$PATH"</code><button type="button" class="secondary" data-copy="guide-install-command">Copy</button></div><p>Then run <code>codexx accounts setup</code> on macOS, or <code>codexx accounts add personal</code> on Linux. <a href="https://github.com/JoRo-Code/codexx#install" target="_blank" rel="noreferrer">Full prerequisites and installation instructions</a>.</p></details>
 <details class="guide-help"><summary>Command not found, or want to update?</summary><p>If Terminal cannot find <code>codexx</code>, run <code>export PATH="$HOME/.local/bin:$PATH"</code>. Add that line once to <code>~/.zshrc</code> (zsh) or <code>~/.bashrc</code> (Bash) for future terminals.</p><p>Run <code>codexx update</code> to install a release, then <code>codexx update all sessions</code> to request safe adoption when sessions are idle. Legacy sessions can be reopened individually when convenient. Open a new setup page to see UI updates.</p></details>
 </section>
-<section class="card"><div class="row"><h2>Accounts & usage</h2><button class="secondary" id="refresh">Refresh usage</button></div><div id="accounts"><p>Loading your accounts…</p></div><p class="muted" id="usage-time"></p><details id="add-account-details"><summary>Add another account</summary><form id="addform"><label for="label">Account label <small>(optional)</small></label><input id="label" maxlength="40" placeholder="e.g. Personal or Work" autocomplete="off"><button id="add">Add account</button></form><p class="muted">Sign in with the account you want to add in the browser that opens.</p></details></section>
+<section class="card"><div class="row"><h2>Accounts & usage</h2><button class="secondary" id="refresh">Refresh usage</button></div><div id="accounts"><p>Loading your accounts…</p></div><p class="muted" id="usage-time"></p><p class="muted">Refresh access token renews a saved login. If it was revoked, use Sign in again and select the same ChatGPT account in the browser. Your chats can stay open while you sign in again.</p><details id="add-account-details"><summary>Add another account</summary><form id="addform"><label for="label">Account label <small>(optional)</small></label><input id="label" maxlength="40" placeholder="e.g. Personal or Work" autocomplete="off"><button id="add">Add account</button></form><p class="muted">Sign in with the account you want to add in the browser that opens.</p></details></section>
 <section class="card"><div class="row"><h2>Chats</h2><span id="chat-count" class="badge">Loading…</span></div><input id="chat-search" type="search" placeholder="Search chats, projects or accounts" aria-label="Search chats"><label><input id="live-only" type="checkbox" style="width:auto;margin-right:8px">Connected only</label><div class="entries" id="chats"></div><p class="muted" id="coverage"></p></section>
 <section class="card"><div class="row"><h2>Activity</h2><select id="event-filter" aria-label="Activity filter"><option value="all">All activity</option><option value="switches">Account switches</option></select></div><p class="muted">Latest 200 recorded events. Times are local to this browser.</p><div class="entries" id="events"></div></section>
 <section class="card"><details><summary><strong>Usage history</strong></summary><p class="muted">Account quota snapshots, sampled every minute while this page is open. Unchanged values are saved every five minutes. Kept for 30 days; latest 100 shown. These are account totals, not per-chat token costs.</p><div class="entries" id="usage-history"></div></details></section>
 <section class="card" id="desktop-connection" tabindex="-1"><div class="row"><h2>Desktop connection</h2><span id="badge" class="badge">Checking</span></div><p id="explain">We’ll configure and start the local connection for you. It starts automatically when you log in to this Mac.</p><button id="connect" disabled>Connect</button><details id="desktop" hidden><summary>Connection instructions</summary><p>The local connection is ready. Link it in Desktop once:</p><ol><li>Open <strong>Settings → Connections → SSH → Add</strong>.</li><li>Use hostname <code id="alias">codex-auto</code> <button id="copy" class="secondary">Copy</button>. Leave port and identity blank.</li><li>Add a project folder on that connection, then start a chat there.</li></ol><p class="muted">Already linked? You’re ready to use that project. Existing chats stay on their current connection.</p></details></section>
 <footer>Runs privately on this Mac. Account credentials stay on this device.<br>Closing this page leaves your chats and background connection running.</footer></main>
 <script>
-const token=location.hash.slice(1)||localStorage.getItem('setup-token')||sessionStorage.getItem('setup-token')||'';if(token)localStorage.setItem('setup-token',token);sessionStorage.removeItem('setup-token');history.replaceState(null,'',location.pathname);let busy=false;
+const token=location.hash.slice(1)||localStorage.getItem('setup-token')||sessionStorage.getItem('setup-token')||'';if(token)localStorage.setItem('setup-token',token);sessionStorage.removeItem('setup-token');history.replaceState(null,'',location.pathname);let busy=false,lastAccountsRender='';
 const $=id=>document.getElementById(id);const say=(s,error=false)=>{$('message').textContent=s;$('message').className=error?'error':''};
 async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(r.status===403?'This setup page expired. Run codexx accounts setup to open it again.':'Could not reach setup. Reopen with codexx accounts setup.');return r.json()}
-function render(s){renderGuide(s);busy=s.job.busy;for(const id of ['add','refresh','connect'])$(id).disabled=busy;const box=$('accounts');box.replaceChildren();for(const a of s.accounts){const d=document.createElement('div');d.className='account';const name=document.createElement('strong');name.textContent=a.label+(a.email?' · '+a.email:'');d.append(name);const p=document.createElement('p');p.className='muted';p.textContent=a.detail;d.append(p);box.append(d)}if(!s.accounts.length){const p=document.createElement('p');p.textContent='Connect your first account to get started.';box.append(p)}$('connect').disabled=busy||!s.accounts.some(a=>a.connected);$('connect').hidden=s.ready;$('desktop').hidden=!s.ready;$('alias').textContent=s.alias;$('badge').textContent=s.ready?'Local connection ready':'Not connected';$('explain').hidden=s.ready;$('usage-time').textContent=s.usage_checked_at?'Checked '+new Date(s.usage_checked_at*1000).toLocaleTimeString()+' · refreshes every minute':'';if(s.job.message)say(s.job.message,s.job.error)}
+function render(s){renderGuide(s);busy=s.job.busy;for(const id of ['add','refresh','connect'])$(id).disabled=busy;const accountRender=JSON.stringify([s.accounts,busy]);const box=$('accounts');if(accountRender!==lastAccountsRender){lastAccountsRender=accountRender;box.replaceChildren();for(const a of s.accounts){const d=document.createElement('div');d.className='account';const name=document.createElement('strong');name.textContent=a.label+(a.email?' · '+a.email:'');d.append(name);const p=document.createElement('p');p.className='muted';p.textContent=a.detail;d.append(p);if(a.connected){const b=document.createElement('button');b.className='secondary';b.textContent='Refresh access token';b.disabled=busy;b.onclick=()=>action('refresh-token',{label:a.label});d.append(b)}const login=document.createElement('button');login.className='secondary';login.textContent='Sign in again';login.disabled=busy;login.onclick=()=>action('reconnect',{label:a.label});d.append(login);box.append(d)}if(!s.accounts.length){const p=document.createElement('p');p.textContent='Connect your first account to get started.';box.append(p)}}$('refresh').disabled=busy||s.usage_busy;$('connect').disabled=busy||!s.accounts.some(a=>a.connected);$('connect').hidden=s.ready;$('desktop').hidden=!s.ready;$('alias').textContent=s.alias;$('badge').textContent=s.ready?'Local connection ready':'Not connected';$('explain').hidden=s.ready;$('usage-time').textContent=s.usage_busy?'Checking usage…':s.usage_checked_at?'Checked '+new Date(s.usage_checked_at*1000).toLocaleTimeString()+' · refreshes every minute':'';if(s.job.message)say(s.job.message,s.job.error)}
 function renderGuide(s){const count=s.accounts.filter(a=>a.connected).length;for(const el of document.querySelectorAll('[data-account-status]'))el.textContent=count?count+' account'+(count===1?'':'s')+' connected — ready to use.':'No accounts connected yet. Add your first account below.';$('guide-connection-status').textContent=s.ready?'Local connection ready. Continue by linking it in Desktop.':'Local connection is not ready yet.';$('guide-hostname').textContent=s.alias;}
 function chooseGuide(mode){for(const name of ['cli','desktop']){$('guide-'+name).hidden=name!==mode;$('guide-'+name+'-choice').setAttribute('aria-pressed',String(name===mode));}}
 $('guide-cli-choice').onclick=()=>chooseGuide('cli');$('guide-desktop-choice').onclick=()=>chooseGuide('desktop');
@@ -3049,6 +3095,7 @@ class SetupWindow:
         self.account,self.port=account,port
         self.mutex=threading.Lock()
         self.job=dict(busy=False,message='',error=False)
+        self.usage_busy=False
         self.reports=[]
         self.activity_cache={}
         self.activity_at=0
@@ -3069,16 +3116,17 @@ class SetupWindow:
             except OSError:pass
             finally:sock.close();ssh.close()
         with self.mutex:
-            reports={r['label']:r for r in self.reports};job=dict(self.job)
+            reports={r['label']:r for r in self.reports};job=dict(self.job);usage_busy=self.usage_busy
         rows=[]
         for name in accounts():
             r=reports.get(name,{})
             connected=(account_home(name)/'auth.json').is_file()
             identity=r.get('identity',('','', ''))
             detail=re.sub(r'\[[#-]+\] ', '', ' · '.join(line for line in usage_lines(r['usage']) if '% left' in line)) if r.get('usage') else ('Usage not checked' if connected else 'Sign-in not complete — add this label again to retry')
+            if r.get('usage_error'):detail=r['usage_error']
             if not detail:detail='Usage unavailable — refresh to check again'
             rows.append(dict(label=name,email=identity[0] if identity[0]!='—' else '',connected=connected,detail=detail))
-        return dict(accounts=rows,ready=ready,alias=settings.get('alias','codex-auto'),job=job,usage_checked_at=self.last_usage_refresh)
+        return dict(accounts=rows,ready=ready,alias=settings.get('alias','codex-auto'),job=job,usage_busy=usage_busy,usage_checked_at=self.last_usage_refresh)
 
     def activity(self):
         with self.activity_mutex:
@@ -3093,19 +3141,40 @@ class SetupWindow:
         self.activity_at=0
 
     def start(self, action, label=''):
-        if action not in ('connect','add','refresh'):raise Error('Unknown setup action')
+        if action not in ('connect','add','refresh','refresh-token','reconnect'):raise Error('Unknown setup action')
         if not isinstance(label,str) or (label and not NAME.fullmatch(label)):raise Error('Use letters, numbers, hyphens or underscores for the account label.')
+        if action in ('refresh-token','reconnect'):require_account(label)
+        if action=='reconnect':
+            try:
+                with lock('token-refresh-' + label), lock('account-' + label, shared=True):pass
+            except Error:
+                raise Error('Another account operation is running for ' + label + '. Wait for it to finish, then click Sign in again. Your chats can stay open.')
+        if action=='refresh':
+            with self.mutex:
+                if self.usage_busy:raise Error('Account usage is already being checked.')
+                self.usage_busy=True
+                self.last_usage_attempt=time.time()
+            threading.Thread(target=self.work,args=(action,label),daemon=True).start()
+            return
         with self.mutex:
             if self.job['busy']:raise Error('An operation is already running.')
-            if action=='refresh':self.last_usage_attempt=time.time()
-            self.job=dict(busy=True,error=False,message={'connect':'Configuring and checking your local connection…','add':'Complete sign-in in the browser. This may take a few minutes.','refresh':'Checking account usage…'}[action])
+            self.job=dict(busy=True,error=False,message={'connect':'Configuring and checking your local connection…','add':'Complete sign-in in the browser. This may take a few minutes.','refresh':'Checking account usage…','refresh-token':'Refreshing access token…','reconnect':'Complete sign-in in the browser using the same ChatGPT account. Your existing login is kept until sign-in succeeds.'}[action])
         threading.Thread(target=self.work,args=(action,label),daemon=True).start()
 
     def work(self, action, label):
         message='';failed=False
         try:
-            with lock('setup-window-job'):
-                if action=='refresh':
+            # Background usage polls from older tabs must not block sign-in.
+            # Credential operations already serialize on the selected account.
+            with (lock('setup-window-job') if action in ('connect','add') else contextlib.nullcontext()):
+                if action=='refresh-token':
+                    report=refresh_account(label)
+                    report.update(label=label)
+                    with self.mutex:
+                        reports=[r for r in self.reports if r['label']!=label]+[report]
+                    self.set_reports(reports)
+                    message=label+': token refresh completed and live access verified.'
+                elif action=='refresh':
                     reports=collect_status()
                     self.set_reports(reports)
                     message='Usage updated.'
@@ -3115,6 +3184,9 @@ class SetupWindow:
                         args+=['setup','--terminal']
                         if self.account:args+=['--account',self.account]
                         if self.port is not None:args+=['--port',str(self.port)]
+                    elif action=='reconnect':
+                        require_account(label)
+                        args+=['login',label]
                     else:
                         if not label:
                             index=1
@@ -3125,18 +3197,25 @@ class SetupWindow:
                     env=dict(os.environ,CODEX_ACCOUNTS_HOME=str(ROOT),CODEX_ACCOUNTS_NO_UPDATE='1')
                     # No OAuth URLs or credentials are forwarded to the web page.
                     process=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env,start_new_session=True)
-                    try:code=process.wait(timeout=600 if action=='add' else 90)
+                    try:code=process.wait(timeout=600 if action in ('add','reconnect') else 90)
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid,signal.SIGTERM);process.wait(timeout=10)
                         raise Error('This step timed out. You can retry it here.')
+                    if code and action=='reconnect':raise Error('Sign-in did not finish. Your previous login was kept. Select the same ChatGPT account and workspace, then retry Sign in again.')
                     if code:raise Error('Sign-in did not finish. Try Add account again with the same label.' if action=='add' else 'Connection setup could not finish. Run codex-accounts setup --terminal for the detailed error. Running chats were not restarted.')
-                    message='Account added. Connect when you’re ready.' if action=='add' else 'Local connection ready. Finish the one-time link in Codex Desktop.'
+                    message=(label+': sign-in renewed. Retry your chat.' if action=='reconnect' else 'Account added. Connect when you’re ready.' if action=='add' else 'Local connection ready. Finish the one-time link in Codex Desktop.')
                     reports=collect_status()
                     self.set_reports(reports)
         except (Error,OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as exc:
-            message=('Another setup window is working. Wait for it to finish, then retry here.' if str(exc)=='This account or conversation is busy. Close its active launcher session and retry.' else str(exc));failed=True
+            if str(exc)=='This account or conversation is busy. Close its active launcher session and retry.':
+                message=('Another token refresh or sign-in is running for ' + label + '. Wait for it to finish, then retry.'
+                         if action in ('refresh-token','reconnect') else 'Another setup window is configuring the connection or adding an account. Wait for it to finish, then retry.')
+            else:message=str(exc)
+            failed=True
         finally:
-            with self.mutex:self.job=dict(busy=False,error=failed,message=message)
+            with self.mutex:
+                if action=='refresh':self.usage_busy=False
+                else:self.job=dict(busy=False,error=failed,message=message)
 
 
 def setup_http_server(window):
@@ -3204,9 +3283,14 @@ def setup_http_server(window):
     return ThreadingHTTPServer(('127.0.0.1',0),Handler)
 
 
+def setup_server_key():
+    # Local reinstalls can change the UI without changing the release version.
+    # Keep old tabs alive while new opens use the updated page and actions.
+    return VERSION + '-' + hashlib.sha256(SETUP_HTML.encode()).hexdigest()[:16]
+
+
 def setup_server_record():
-    # A new release gets a new UI server; old tabs may finish on their loaded version.
-    return ROOT / 'setup-web' / (VERSION + '.json')
+    return ROOT / 'setup-web' / (setup_server_key() + '.json')
 
 
 def setup_server_request(record, path, body=None):
@@ -3236,14 +3320,14 @@ def existing_setup_server():
 @contextlib.contextmanager
 def setup_start_lock():
     private_dir(ROOT/'locks')
-    with (ROOT/'locks'/('setup-start-'+VERSION+'.lock')).open('a') as stream:
+    with (ROOT/'locks'/('setup-start-'+setup_server_key()+'.lock')).open('a') as stream:
         # Launch is short; simultaneous commands wait and reuse the first server.
         fcntl.flock(stream,fcntl.LOCK_EX)
         yield
 
 
 def serve_setup_window(account=None,port=None):
-    with lock('setup-server-'+VERSION):
+    with lock('setup-server-'+setup_server_key()):
         window=SetupWindow(account,port)
         server=setup_http_server(window);server.timeout=1
         record={'port':server.server_port,'token':window.token}
