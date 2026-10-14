@@ -19,6 +19,7 @@ jobs:
       - run: python test_bundle_update.py
       - run: python test_shared.py
       - run: python test_auto.py
+      - run: python test_auth_failover.py
       - run: python test_status.py
       - run: python test_update.py
       - run: python test_live_update.py

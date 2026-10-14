@@ -1710,6 +1710,24 @@ import struct
 from collections import deque
 
 QUOTA_ERRORS = {'usageLimitExceeded', 'rateLimitExceeded'}
+def account_failure(error):
+    """Classify terminal model-service errors, never tool output or item text."""
+    if not isinstance(error, dict): return None
+    info = error.get('codexErrorInfo')
+    if isinstance(info, str) and info in QUOTA_ERRORS: return info
+    if isinstance(info, dict):
+        for kind in ('httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected'):
+            detail = info.get(kind)
+            if isinstance(detail, dict) and detail.get('httpStatusCode') == 401:
+                return 'authenticationFailed'
+    message = str(error.get('message') or '').lower()
+    # Workspace discovery currently reports an unstructured error. Keep the
+    # fallback narrow so a tool's unrelated authorization error cannot rotate.
+    if ('workspace routing discovery' in message and
+            re.search(r'\b401\b', message) and 'unauthorized' in message):
+        return 'authenticationFailed'
+    return None
+
 
 class WebSocket:
     """Minimal RFC 6455 server transport over a private Unix-domain socket."""
@@ -1843,7 +1861,7 @@ def quota_ready_accounts(exclude=()):
     return ready
 
 def mark_quota_failure(name, error, snapshot=None):
-    windows = [(snapshot or {}).get(k) or {} for k in ('primary','secondary')]
+    windows = [(snapshot or {}).get(k) or {} for k in ('primary','secondary')] if error in QUOTA_ERRORS else []
     resets = [w.get('resetsAt') for w in windows if w.get('usedPercent', 0) >= 100
               and isinstance(w.get('resetsAt'), (int,float)) and w['resetsAt'] > time.time()]
     # A timer schedules another attempt; it does not claim quota has recovered.
@@ -2063,8 +2081,8 @@ class AutoBridge:
                 self.phase = 'waiting for input'
                 self.update_marker()
         if method == 'error' and params.get('threadId') == self.sid and not params.get('willRetry', True):
-            code = (params.get('error') or {}).get('codexErrorInfo')
-            if isinstance(code, str) and code in QUOTA_ERRORS:
+            code = account_failure(params.get('error'))
+            if code:
                 self.quota_errors[params.get('turnId')] = code
         if method == 'account/rateLimits/updated':
             incoming = params.get('rateLimits') or {}
@@ -2085,9 +2103,9 @@ class AutoBridge:
         params = message.get('params', {})
         if params.get('threadId') != self.sid: return
         turn = params.get('turn') or {}
-        info = (turn.get('error') or {}).get('codexErrorInfo') or self.quota_errors.get(turn.get('id'))
+        info = account_failure(turn.get('error')) or self.quota_errors.get(turn.get('id'))
         self.quota_errors.pop(turn.get('id'), None)
-        if turn.get('status') == 'failed' and isinstance(info, str) and info in QUOTA_ERRORS:
+        if turn.get('status') == 'failed' and info:
             self.failover(info)
     def rpc(self, method, params, timeout=30):
         self.counter += 1
@@ -2118,7 +2136,8 @@ class AutoBridge:
         # history, so no tools or history writers survive on the source account.
         self.reconnect_account(target)
         self.tried.add(target)
-        continuation = ('Continue the unfinished request from the preceding turn. The account reached its usage limit '
+        reason = 'authentication was rejected' if info == 'authenticationFailed' else 'usage limit was reached'
+        continuation = ('Continue the unfinished request from the preceding turn. The account\'s ' + reason + ' '
                         'and the launcher reconnected this conversation using another account. Inspect the saved history '
                         'and current state, preserve completed work, and do not repeat completed side effects.')
         self.rpc('turn/start', dict(self.continuation_options, threadId=self.sid,
@@ -2357,9 +2376,11 @@ def router_bridge_class(lane):
                 self.update_marker()
                 lane.router.notice(self.sid, 'Account switch failed: '+str(exc))
             if self.phase == 'failed':
-                self.phase = 'waiting for quota'
+                self.phase = 'waiting for authentication' if info == 'authenticationFailed' else 'waiting for quota'
                 self.update_marker()
-                lane.router.notice(self.sid, 'No other account is ready. Resume after an account reset or add another account.')
+                lane.router.notice(self.sid, 'No other account is ready. Reconnect an account with codexx accounts login <name> and resume.'
+                                   if info == 'authenticationFailed' else
+                                   'No other account is ready. Resume after an account reset or add another account.')
     return Bridge
 
 Backend._live_native_backend = True

@@ -583,3 +583,5 @@ python3 test_native_router.py
 python3 test_native_router.py --proactive
 python3 test_native_router.py --live
 ```
+
+Terminal workspace-routing authentication failures (401) also trigger automatic account rotation. The rejected account is skipped for five minutes and is tried at most once per continuation chain. If every eligible account fails, the chat stops with a reconnect instruction; tool authorization errors do not trigger account rotation.
