@@ -6,7 +6,8 @@ jobs:
   unit:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Python 3.9 has published builds for Ubuntu 24.04, not 26.04.
+        os: [ubuntu-24.04, macos-latest]
         python: ['3.9', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
