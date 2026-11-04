@@ -335,6 +335,8 @@ def main(args=None):
         binary = shutil.which(app.BINARY)
         if not binary: raise app.Error('Codex CLI was not found on PATH.')
         os.execv(binary, [binary, *args[1:]])
+    if args[:1] == ['resources']:
+        os.execv(sys.executable, [sys.executable, app.__file__, *args])
     if args[:1] == ['accounts']:
         tail = args[1:]
         if tail[:2] == ['desktop', 'setup']:
@@ -355,6 +357,7 @@ def main(args=None):
             print('\ncodexx: automatic account routing for interactive chats and resume/fork.')
             print('  codexx accounts setup          Open account management in your browser')
             print('  codexx accounts --help         Account administration')
+            print('  codexx resources              Inspect chat servers and memory')
             print('  codexx update                 Update the complete Codexx bundle')
             print('  codexx update all sessions    Request safe adoption; never restart chats')
             print('  codexx update status          Show current/pending/legacy sessions')

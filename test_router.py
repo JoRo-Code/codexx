@@ -1,5 +1,7 @@
 import json
 import os
+import socket
+import threading
 import time
 import uuid
 import unittest
@@ -8,6 +10,116 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import test_launcher as fixtures
 app=fixtures.app
+
+class ReplyTransportTests(unittest.TestCase):
+    def test_partial_write_disconnects_before_another_reply(self):
+        for transport_class in (app.JsonSocket, app.WebSocket):
+            with self.subTest(transport=transport_class.__name__):
+                sender, peer = socket.socketpair()
+                self.addCleanup(sender.close)
+                self.addCleanup(peer.close)
+                peer.settimeout(.2)
+
+                class PartialSocket:
+                    failed = False
+                    def settimeout(self, value): sender.settimeout(value)
+                    def shutdown(self, how): sender.shutdown(how)
+                    def sendall(self, data):
+                        if not self.failed:
+                            self.failed = True
+                            sender.sendall(data[:24])
+                            raise socket.timeout('slow reader')
+                        sender.sendall(data)
+
+                transport = transport_class.__new__(transport_class)
+                transport.sock = PartialSocket()
+                client = app.RouterClient(transport)
+                router = app.MultiRouter.__new__(app.MultiRouter)
+                router.clients = {client}
+                router.reply(client, {'id':1, 'result':{'history':'x'*1000}})
+                wait_for(lambda: client.writer_stopped.is_set())
+                # Pending requests can still refer to a disconnected client.
+                router.reply(client, {'id':2, 'error':{'message':'retry'}})
+                self.assertNotIn(client, router.clients)
+                self.assertEqual(len(peer.recv(4096)), 24)
+                self.assertEqual(peer.recv(4096), b'')
+
+    def test_reply_extends_handshake_timeout_for_large_messages(self):
+        sender, peer = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(peer.close)
+        sender.settimeout(5)
+        client = app.RouterClient(app.JsonSocket(sender))
+        self.addCleanup(lambda: app.RouterClient.close(client))
+        router = app.MultiRouter.__new__(app.MultiRouter)
+        router.clients = {client}
+        router.reply(client, {'id':1, 'result':{}})
+        self.assertEqual(sender.gettimeout(), 45)
+        self.assertEqual(app.JsonSocket(peer).read(), [{'id':1, 'result':{}}])
+
+    def test_slow_reader_cannot_block_other_clients_or_grow_an_unbounded_queue(self):
+        sender, peer = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(peer.close)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        client = app.RouterClient(app.JsonSocket(sender))
+        self.addCleanup(lambda: app.RouterClient.close(client))
+        router = app.MultiRouter.__new__(app.MultiRouter)
+        router.clients = {client}
+        router.mutex = threading.RLock()
+        started = threading.Event()
+        original = client.send
+        def sending(message):
+            started.set()
+            original(message)
+        client.send = sending
+        with router.mutex:
+            router.reply(client, {'id':1, 'result':{'history':'x'*(1024*1024)}})
+        self.assertTrue(started.wait(1))
+        healthy = Client()
+        with router.mutex:
+            router.reply(healthy, {'id':2, 'result':{'ready':True}})
+        self.assertEqual(healthy.messages, [{'id':2, 'result':{'ready':True}}])
+        for ident in range(3, 1100):
+            with router.mutex:
+                router.reply(client, {'id':ident, 'result':{}})
+        self.assertTrue(client.writer_stopped.is_set())
+        self.assertNotIn(client, router.clients)
+        client.writer.join(timeout=1)
+        self.assertFalse(client.writer.is_alive())
+
+    def test_normal_notification_burst_preserves_order(self):
+        sender, peer = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(peer.close)
+        peer.settimeout(2)
+        client = app.RouterClient(app.JsonSocket(sender))
+        self.addCleanup(lambda: app.RouterClient.close(client))
+        router = app.MultiRouter.__new__(app.MultiRouter)
+        router.clients = {client}
+        for ident in range(256):
+            router.reply(client, {'method':'item/agentMessage/delta', 'params':{'delta':str(ident)}})
+        stream = peer.makefile('rb')
+        self.addCleanup(stream.close)
+        messages = [json.loads(stream.readline()) for _ in range(256)]
+        self.assertEqual([m['params']['delta'] for m in messages], [str(i) for i in range(256)])
+        self.assertFalse(client.writer_stopped.is_set())
+
+    def test_disconnect_releases_writer_and_queued_replies(self):
+        sender, peer = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(peer.close)
+        client = app.RouterClient(app.JsonSocket(sender))
+        router = app.MultiRouter.__new__(app.MultiRouter)
+        router.mutex = threading.RLock()
+        router.clients = {client}
+        router.client_initializes = {client:{}}
+        router.requests = {}
+        router.reply(client, {'id':1, 'result':{}})
+        router.disconnect(client)
+        client.writer.join(timeout=1)
+        self.assertFalse(client.writer.is_alive())
+        self.assertTrue(client.outbox.empty())
 
 class Client:
     def __init__(self):self.messages=[]
@@ -119,5 +231,13 @@ class RouterTests(unittest.TestCase):
     def test_auth_mutation_is_rejected(self):
         r,c=self.router()
         with self.assertRaises(app.Error):r.route(c,{'id':9,'method':'account/logout'})
+
+    def test_status_reports_transport_state_without_history(self):
+        r,c=self.router();self.request(r,c,'thread/resume',{'threadId':self.sid})
+        status=self.request(r,c,'codexx/status',{})['result']
+        lane=next(x for x in status['lanes'] if x['session']==self.sid)
+        self.assertFalse(lane['stopped'])
+        self.assertEqual(lane['buffered_bytes'],0)
+        self.assertNotIn('Fix login page',json.dumps(status))
 
 if __name__=='__main__':unittest.main()

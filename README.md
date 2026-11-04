@@ -26,7 +26,8 @@ codexx fork SESSION_ID
 When the managed Desktop router is reachable, `codexx` connects to that existing
 process directly. No Desktop window or SSH connection is needed. Otherwise it
 starts a private local router on demand; subsequent terminals reuse it. Closing a
-terminal disconnects it and leaves the router and its chats running. The terminal
+terminal disconnects it and leaves active work running. Inactive chat servers
+can unload automatically and resume on their next request. The terminal
 keeps native flags and the native resume/fork picker, with history combined across
 connected accounts. A per-terminal notification filter keeps other clients' chats
 and approvals out of the terminal. Separate `codex-accounts auto` processes share
@@ -382,7 +383,7 @@ Each account shows:
 - Automatic-session activity: starting, working, waiting for input, idle, failed, or switching accounts.
 - Account routing cooldowns.
 
-`--watch --interval 60` changes the refresh interval (minimum 10 seconds). Press Ctrl-C to close the dashboard; running conversations keep going. If a lookup fails, that account shows limits unavailable while the others remain visible. Unknown limits are never reported as zero usage. Displayed reset times do not establish that backend access has recovered. The dashboard does not redeem resets, buy credits, send notifications, or change routing state.
+`--watch --interval 60` changes the refresh interval (minimum 10 seconds). Press Ctrl-C to close the dashboard; running conversations keep going. If a lookup fails, that account shows limits unavailable while the others remain visible. Unknown limits are never reported as zero usage. Displayed reset times do not establish that backend access has recovered. The dashboard does not redeem resets, buy credits, send notifications, or clear quota cooldowns. Successful quota reads update the shared routing quota cache.
 
 Limits come from OpenAI's account endpoint and can reflect usage outside the launcher. Session locations cover only launcher processes on this computer; desktop sessions and ordinary `codex` processes are not inventoried. Manual mode reports the CLI as open because it cannot observe turn activity. Restart older launcher processes to get the new project/title/activity tracking. Workspace credit balances can be shared across accounts and should not be summed as independent allowances.
 
@@ -405,7 +406,7 @@ cd /path/to/project
 codex-accounts auto
 ```
 
-Open as many terminals as you need and run the same command. The launcher chooses a connected account using active-session counts and least-recent selection, skipping accounts in cooldown. You keep the normal Codex terminal UI, approvals, and tool interactions.
+Open as many terminals as you need and run the same command. The launcher concentrates new sessions on the same account until its quota is exhausted, skipping accounts in cooldown. With known quota windows it prefers the nearest reset of the longest window (normally the weekly budget), then the more-used budget. Without current quota data it prefers the most recently selected account, then the account already running more sessions. Live quota reads and backend updates share quota windows across processes; passed reset times permit retry but do not prove quota recovery. Existing conversations keep their account until quota failover or the configured pre-turn threshold triggers a switch. You keep the normal Codex terminal UI, approvals, and tool interactions.
 
 ```sh
 codex-accounts auto --account personal    # Choose the starting account
@@ -552,7 +553,70 @@ The publisher uploads a standalone CLI, its checksum, and a source archive to a 
 
 ## Experimental native Desktop / multi-session router
 
-Version 0.8 adds a persistent local protocol router. Each loaded root chat owns a separate Codex app-server process, account, writer lock, and request queue. A quota failure migrates only that chat's saved history, then resumes its unfinished request on an eligible account. Other chat backends keep running. Disconnecting a client leaves its chats running until the router is stopped. This uses more memory than a single shared backend.
+The persistent local protocol router gives each loaded root chat a separate Codex app-server process, account, writer lock, and request queue. A quota failure migrates only that chat's saved history, then resumes its unfinished request on an eligible account. Other chat backends keep running. Disconnecting a client leaves active work running. Version 0.14 unloads safe, inactive servers and restores saved chats when needed.
+
+### Idle servers and background resources
+
+Automatic resource management defaults to **10 minutes of inactivity** and **six
+idle chat servers across routers sharing the same account data directory**.
+The oldest eligible servers unload first. Control servers and protected sessions
+are outside this idle cache budget; this is not a hard limit on active work.
+Each maintenance pass schedules at most two checks. Failed safety checks retry
+at most once a minute.
+
+    codexx resources                         # Server state, resident memory and blockers
+    codexx resources status --json
+    codexx resources prune                   # Verify candidates; preview only
+    codexx resources prune --apply           # Unload up to eight safe servers per call
+    codexx resources pin SESSION_ID          # Keep a session's runtime alive
+    codexx resources unpin SESSION_ID
+    codexx resources policy --idle-seconds 600 --max-idle 6
+    codexx resources policy --off            # Keep diagnostics and manual prune
+    codexx resources policy --on
+
+Every unload is serialized with incoming requests in the chat's worker. The
+worker verifies saved history, all loaded thread statuses (including subagents),
+background terminals, queued submissions and continuing goals. Outstanding
+requests, approvals, unfinished tools, ephemeral threads, realtime sessions and
+known stateful runtimes such as Node REPL prevent unloading. Unknown or unsupported
+native diagnostics keep the server alive and report a blocker. A sleeping OS
+process alone is never considered proof that its chat can be unloaded.
+
+Unloading stops the owned backend and its process group and releases writer
+locks. A private resume descriptor preserves the account-independent thread ID,
+client initialization, resume options and changed thread settings. Rehydration
+resolves the current account owner, restores the chat and settings, and forwards
+the waiting request once. If restore fails, the request receives an error and
+the saved history remains available; a user turn is never automatically retried.
+Browsing saved history does not wake the chat server. The descriptor also survives
+a router restart. Reloading an inactive server can add latency to the next request.
+
+Chat history does **not** restore in-memory REPL variables. Pin a runtime you need
+to preserve. Background resources can also be registered explicitly:
+
+    codexx resources register SESSION_ID --pid 12345 --kind preview --lifetime persistent
+    codexx resources register SESSION_ID --pid 12346 --kind terminal --lifetime session
+    codexx resources release SESSION_ID --pid 12345
+
+Registration verifies that the PID belongs to this managed chat's descendants
+and records its process start identity. A persistent resource keeps the backend
+alive while that exact process exists. A session-scoped resource is allowed to
+stop with an otherwise safely unloaded backend. Native background jobs still
+block unloading unless their exact PID and start identity were explicitly
+registered with session lifetime. Releasing a registration does not stop a
+process or override other safety blockers. Existing detached development servers
+are not guessed at or killed. RSS figures exclude compressed and swapped memory.
+
+This lifecycle changes the live runtime ABI from 1 to 2. Installing the bundle
+preserves existing services: older routers defer live adoption and continue on
+their loaded code. Resource status identifies these routers. Restart them between
+jobs to activate this policy; new routers use it immediately. Routine compatible
+updates remain supported after that transition.
+
+Lifecycle regression checks:
+
+    python3 test_resources.py
+    python3 test_native_router.py --resources   # Real backends; no model requests
 
 Start the router in a private, short-path directory:
 

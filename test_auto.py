@@ -165,9 +165,9 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(app.read_json(app.ROOT/'routing.json')['personal']['retry_after'],reset)
         self.assertEqual(app.eligible_accounts(),['work'])
 
-    def test_selection_balances_active_sessions(self):
+    def test_selection_concentrates_active_sessions(self):
         app.atomic_json(app.ROOT/'runs/current.json',{'pid':os.getpid(),'account':'personal','session':self.sid})
-        self.assertEqual(app.eligible_accounts()[0],'work')
+        self.assertEqual(app.eligible_accounts()[0],'personal')
 
     def test_cooldown_expiry_only_makes_account_eligible_for_retry(self):
         app.atomic_json(app.ROOT/'routing.json',{'personal':{'retry_after':time.time()-1}})
@@ -344,4 +344,58 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(data[0],0x81)
         self.assertEqual(json.loads(data[2:]),{'ok':True})
 
-if __name__=='__main__': unittest.main()
+
+
+class DrainRoutingTests(unittest.TestCase):
+    setUp = fixtures.LauncherTests.setUp
+    def test_repeated_selections_keep_same_account(self):
+        app.mark_selected('work')
+        for _ in range(5):
+            self.assertEqual(app.eligible_accounts()[0], 'work')
+            app.mark_selected('work')
+
+    def test_weekly_reset_beats_session_count_and_short_window(self):
+        now = time.time()
+        app.cache_routing_usage('personal', {'rateLimits': {
+            'primary': {'usedPercent': 20, 'windowDurationMins': 300, 'resetsAt': now+100},
+            'secondary': {'usedPercent': 30, 'windowDurationMins': 10080, 'resetsAt': now+2000}}})
+        app.cache_routing_usage('work', {'rateLimits': {
+            'primary': {'usedPercent': 20, 'windowDurationMins': 300, 'resetsAt': now+200},
+            'secondary': {'usedPercent': 80, 'windowDurationMins': 10080, 'resetsAt': now+1000}}})
+        app.mark_selected('personal')
+        self.assertEqual(app.eligible_accounts()[0], 'work')
+        app.mark_quota_failure('work', 'usageLimitExceeded')
+        self.assertEqual(app.eligible_accounts(), ['personal'])
+
+    def test_exhausted_window_excluded_until_reset_then_retryable(self):
+        now = time.time()
+        app.cache_routing_usage('personal', {'rateLimits': {
+            'primary': {'usedPercent': 100, 'resetsAt': now+100}}})
+        self.assertEqual(app.eligible_accounts(), ['work'])
+        with patch.object(app.time, 'time', return_value=now+101):
+            self.assertIn('personal', app.eligible_accounts())
+
+    def test_live_picker_uses_same_drain_order(self):
+        reports = [dict(label=name, identity=('email','pro','cached'),
+            usage={'ordinaryUsageAllowed': True}, runs=[{}]*count,
+            routing={'last_selected': selected})
+            for name, count, selected in [('personal', 0, 1), ('work', 5, 2)]]
+        self.assertEqual(app.select_ready_account(reports)['label'], 'work')
+
+    def test_sparse_and_other_model_updates_preserve_weekly_quota(self):
+        weekly = {'usedPercent': 80, 'windowDurationMins': 10080, 'resetsAt': time.time()+1000}
+        app.cache_routing_usage('work', {'rateLimitsByLimitId': {'codex': {'secondary': weekly}}})
+        app.cache_routing_usage('work', {'rateLimits': {'primary': {'usedPercent': 5}, 'secondary': None}})
+        app.cache_routing_usage('work', {'rateLimits': {'limitId': 'other-model', 'secondary': {'usedPercent': 100}}})
+        self.assertEqual(app.read_json(app.ROOT/'routing.json')['work']['quota']['secondary'], weekly)
+        self.assertEqual(app.eligible_accounts()[0], 'work')
+
+    def test_equal_resets_drain_more_used_account(self):
+        reset = time.time()+1000
+        for name, percent in [('personal', 20), ('work', 80)]:
+            app.cache_routing_usage(name, {'rateLimits': {'secondary': {
+                'usedPercent': percent, 'windowDurationMins': 10080, 'resetsAt': reset}}})
+        self.assertEqual(app.eligible_accounts()[0], 'work')
+        self.assertEqual(app.eligible_accounts({'work'}), ['personal'])
+
+if __name__ == '__main__': unittest.main()

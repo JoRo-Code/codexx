@@ -7,6 +7,7 @@ if not binary:raise SystemExit('Codex CLI required')
 source=Path(__file__).with_name('codex-accounts').resolve()
 proactive='--proactive' in sys.argv
 live='--live' in sys.argv
+resources='--resources' in sys.argv
 with tempfile.TemporaryDirectory(prefix='car-',dir='/tmp') as tmp:
     root=Path(tmp);address=root/'r.sock';sid=str(uuid.uuid4())
     if live:
@@ -133,6 +134,27 @@ app.serve_router(sys.argv[2], 'a')
         assert any('shared_fixture' in row['tools'] for row in c.rpc('mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
         listed=c.rpc('thread/list',{'sourceKinds':['cli','appServer','vscode'],'limit':100})['data']
         assert sid in {r['id'] for r in listed}, listed
+        if resources:
+            command = subprocess.run([sys.executable,str(source),'resources','status','--socket',str(address),'--json'],
+                                     env=env,capture_output=True,text=True,timeout=20,check=True)
+            assert json.loads(command.stdout)['routers'][0]['resourceManagement']
+            before = c.rpc('codexx/status', {})
+            original = next(row for row in before['lanes'] if row['session'] == sid)['pid']
+            preview = c.rpc('codexx/resources/prune', {'threadId':sid})
+            assert preview['results'][0]['result'] == 'would_unload', preview
+            unloaded = c.rpc('codexx/resources/prune', {'threadId':sid,'apply':True})
+            assert unloaded['results'][0]['result'] == 'unloaded', unloaded
+            assert sid not in c.rpc('thread/loaded/list', {})['data']
+            assert c.rpc('thread/read', {'threadId':sid})['thread']['id'] == sid
+            assert sid not in c.rpc('thread/loaded/list', {})['data']
+            # Connected clients can keep using the same chat. No model call.
+            c.rpc('thread/settings/update', {'threadId':sid,'effort':'high'})
+            after = c.rpc('codexx/status', {})
+            restored = next(row for row in after['lanes'] if row['session'] == sid)
+            assert restored['pid'] != original and restored['state'] == 'loaded', restored
+            assert any('shared_fixture' in row['tools'] for row in c.rpc(
+                'mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
+            print('PASS: native idle check, dry run, process exit, history browsing without wake, transparent restore and MCP tools.')
         if live:
             def markers():return [json.loads(p.read_text()) for p in (root/'runs').glob('router-*.json')]
             def wait_until(predicate):
@@ -144,16 +166,19 @@ app.serve_router(sys.argv[2], 'a')
             c.rpc('turn/start',{'threadId':sid,'input':[{'type':'text','text':'Hold update test','text_elements':[]}]})
             wait_until(lambda:any(m['session']==sid and m['phase']=='working' for m in markers()))
             starts=(root/'backend-starts.jsonl').read_text()
-            source.write_text(source.read_text().replace("VERSION = '0.13.0'", "VERSION = '0.13.1'")+'''
+            import re
+            original_version = re.search(r"^VERSION = '([^']+)'", source.read_text(), re.M)[1]
+            updated_version = original_version + '.test'
+            source.write_text(source.read_text().replace("VERSION = '"+original_version+"'", "VERSION = '"+updated_version+"'")+'''
 account_snapshot=lambda name,**kwargs: {'usage':{'ordinaryUsageAllowed':True,
     'rateLimits':{'primary':{'usedPercent':97 if name=='a' else 0},'credits':{'hasCredits':True}}}}
 ''')
-            wait_until(lambda:any(m['session']==other and m['tracking_version']=='0.13.1' for m in markers()))
-            assert any(m['session']==sid and m['tracking_version']=='0.13.0' and m['phase']=='working' for m in markers())
+            wait_until(lambda:any(m['session']==other and m['tracking_version']==updated_version for m in markers()))
+            assert any(m['session']==sid and m['tracking_version']==original_version and m['phase']=='working' for m in markers())
             assert (root/'backend-starts.jsonl').read_text()==starts
             assert b.rpc('thread/read',{'threadId':other})['thread']['id']==other
             c.rpc('turn/interrupt',{'threadId':sid,'turnId':'held-turn'})
-            wait_until(lambda:any(m['session']==sid and m['tracking_version']=='0.13.1' for m in markers()))
+            wait_until(lambda:any(m['session']==sid and m['tracking_version']==updated_version for m in markers()))
             assert (root/'backend-starts.jsonl').read_text()==starts
             assert c.rpc('thread/read',{'threadId':sid})['thread']['id']==sid
             assert any('shared_fixture' in row['tools'] for row in c.rpc('mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
@@ -180,6 +205,16 @@ account_snapshot=lambda name,**kwargs: {'usage':{'ordinaryUsageAllowed':True,
             assert [row['account'] for row in sent]==['a','b'],sent
             print('PASS: native proxy, two chats, reconnect, combined history and shared MCP tools after injected quota failover; separate credentials, no model requests.')
         if live:print('PASS: installed file update during active turn; idle chat adopts immediately, active chat after completion; same clients and backend PIDs, shared MCP retained.')
+        if resources:
+            (root/'resource-policy.json').write_text(json.dumps({'enabled':True,'idle_seconds':0,'max_idle':6}))
+            deadline = time.monotonic()+20
+            while time.monotonic() < deadline:
+                report = c.rpc('codexx/status', {})
+                state = next(row for row in report['lanes'] if row['session'] == sid)
+                if state['state'] == 'sleeping': break
+                time.sleep(.25)
+            assert state['state'] == 'sleeping', state
+            print('PASS: native maintenance automatically unloads an idle server after the configured timeout.')
     finally:
         for c in clients:c.close()
         server.terminate()

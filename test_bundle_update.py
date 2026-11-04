@@ -130,10 +130,10 @@ class BundleTests(unittest.TestCase):
 
     def test_all_sessions_records_request_without_restarting_or_claiming_legacy_updated(self):
         target = self.app.read_json(self.generation / 'bundle.json')
-        rows = [dict(pid=os.getpid(), session='current', live_runtime_abi=1, launcher_generation=target['engine']),
-                dict(pid=os.getpid(), session='busy', live_runtime_abi=1, launcher_generation='old', phase='working'),
+        rows = [dict(pid=os.getpid(), session='current', live_runtime_abi=self.app.LIVE_RUNTIME_ABI, launcher_generation=target['engine']),
+                dict(pid=os.getpid(), session='busy', live_runtime_abi=self.app.LIVE_RUNTIME_ABI, launcher_generation='old', phase='working'),
                 dict(pid=os.getpid(), session='legacy'),
-                dict(pid=os.getpid(), session='incompatible', live_runtime_abi=2)]
+                dict(pid=os.getpid(), session='incompatible', live_runtime_abi=999)]
         with patch.object(self.app, 'active_runs', return_value=rows), patch.object(os, 'kill') as kill:
             status = updates.session_status(self.app, request=True)
             kill.assert_not_called()

@@ -2,6 +2,7 @@
 from collections import deque
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import test_launcher as fixtures
@@ -22,9 +23,10 @@ class LiveUpdateTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         return runtime
 
-    def replace(self, runtime, version='0.12.2', extra='', abi=1):
+    def replace(self, runtime, version='0.12.2', extra='', abi=None):
         payload = SOURCE.replace('VERSION = '+repr(app.VERSION), 'VERSION = '+repr(version))
-        payload = payload.replace('LIVE_RUNTIME_ABI = 1', 'LIVE_RUNTIME_ABI = '+str(abi))
+        if abi is not None:
+            payload = payload.replace('LIVE_RUNTIME_ABI = '+str(app.LIVE_RUNTIME_ABI), 'LIVE_RUNTIME_ABI = '+str(abi))
         self.source.write_text(payload+'\n'+extra)
         runtime.refresh(force=True)
 
@@ -66,7 +68,7 @@ class LiveUpdateTests(unittest.TestCase):
         self.source.write_text('invalid python !!!')
         runtime.refresh(force=True)
         self.assertIs(runtime.module,original);self.assertIsNotNone(runtime.error)
-        self.replace(runtime,abi=2)
+        self.replace(runtime,abi=999)
         self.assertIs(runtime.module,original);self.assertIn('ABI',runtime.error)
         self.replace(runtime,extra='AutoBridge = lambda: None')
         self.assertIs(runtime.module,original);self.assertIn('layout',runtime.error)
@@ -123,5 +125,28 @@ class LiveUpdateTests(unittest.TestCase):
             app.record_update(policy='off',last_check=0)
             runtime.check_update()
             self.assertEqual(spawn.call_count,2)
+
+    def test_pending_reply_can_adopt_reader_without_restarting_backend(self):
+        runtime=self.runtime()
+        router=app.MultiRouter(factory=Backend)
+        router.runtime.close();router.runtime=runtime
+        self.addCleanup(router.close)
+        client=Client()
+        router.route(client,{'id':1,'method':'initialize','params':{}})
+        backend=app.Backend.__new__(app.Backend)
+        backend.buffer=bytearray(b'partial history')
+        backend.messages=deque()
+        backend.process=object()
+        bridge=SimpleNamespace(backend=backend,pending={'request':'thread/resume'},phase='idle')
+        lane=type('Lane',(),{})();lane.bridge=bridge
+        router.lanes.add(lane)
+        self.addCleanup(router.lanes.discard,lane)
+        original_process=backend.process
+        self.replace(runtime,extra='Backend.read = lambda self: "updated reader"')
+        router.route(client,{'id':2,'method':'thread/loaded/list','params':{}})
+        self.assertEqual(backend.read(),'updated reader')
+        self.assertEqual(backend.buffer,b'partial history')
+        self.assertEqual(bridge.pending,{'request':'thread/resume'})
+        self.assertIs(backend.process,original_process)
 
 if __name__=='__main__':unittest.main()

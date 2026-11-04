@@ -9,6 +9,7 @@ import io
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import sqlite3
 import subprocess
@@ -19,9 +20,9 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.13.2'
+VERSION = '0.14.0'
 # Bump only when live object state/protocol can no longer be adopted in place.
-LIVE_RUNTIME_ABI = 1
+LIVE_RUNTIME_ABI = 2
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -34,6 +35,25 @@ AUTH_ENV = ('OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN',
 
 class Error(Exception):
     pass
+
+def prepare_file_limit():
+    """Give persistent session backends headroom, including during live reload.
+
+    Keep the target within select()'s FD_SETSIZE (1024). Raising further
+    requires migrating every reader, including already-running readers.
+    Never lower an existing limit or change the hard limit.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = 1024 if hard == resource.RLIM_INFINITY else min(1024, hard)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (OSError, ValueError) as exc:
+            print('codex-accounts: could not raise open-file limit: ' + str(exc), file=sys.stderr)
+
+# LiveRuntime executes the module in the existing process, so this also
+# repairs a running router without closing its sockets or active sessions.
+prepare_file_limit()
 
 def private_dir(path):
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -468,6 +488,8 @@ def session_records(account=None):
                     continue
                 meta = meta['payload']
                 sid = str(uuid.UUID(meta['id']))
+                if path.relative_to(home / 'sessions').parts[0] == 'lineage' and ownership.get(sid) != name:
+                    continue
                 if ownership.get(sid, name) != name:
                     continue
                 result.append(dict(id=sid, account=name, cwd=meta.get('cwd', ''),
@@ -555,10 +577,13 @@ def active_runs():
     return runs
 
 def guard_idle(row):
+    # Unknown session IDs are normal for new/manual CLIs and do not mean
+    # they own this history. move() holds the native writer locks for this
+    # thread on both accounts, including writers not tracked by our markers.
     for run in active_runs():
-        if run['account'] == row['account'] and (run['session'] == row['id'] or run['session'] is None):
-            raise Error('The conversation may still be running. Close the source CLI first. '
-                        'New sessions on this account must also be closed before moving history.')
+        if run['account'] == row['account'] and run['session'] == row['id']:
+            raise Error('This conversation is open in another CLI. Close that CLI before moving its history. '
+                        'Other conversations can stay open.')
 
 def login_identity(auth):
     """Compare native credential identities, without exposing token contents."""
@@ -687,6 +712,125 @@ def reset_history_projection(home, sid):
     finally:
         db.close()
 
+
+def copy_ancestor_projection(source_home, target_home, sid, required_bytes):
+    """Preserve ancestor indexes: native resume rebuilds only the child index."""
+    filename = 'thread_history_1.sqlite'
+    source = Path(source_home) / filename
+    if not source.exists():
+        raise Error('Ancestor history index is missing; resume the source conversation before moving its fork.')
+    tables = {'thread_turns', 'thread_items', 'thread_history_projection_state', 'thread_realtime_items'}
+    with contextlib.closing(sqlite3.connect(source.as_uri()+'?mode=ro', uri=True)) as src, \
+            contextlib.closing(sqlite3.connect(Path(target_home)/filename, timeout=5)) as dst:
+        src.execute('BEGIN')
+        schema = list(src.execute("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table', 'index')"))
+        if {name for kind,name,sql in schema if kind == 'table'} - tables - {'_sqlx_migrations'}:
+            raise Error('Unsupported ancestor history schema; no conversation was moved.')
+        state = src.execute('SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?', (sid,)).fetchone()
+        if not state or state[0] < required_bytes:
+            raise Error('Ancestor history index is incomplete; resume the source conversation before moving its fork.')
+        try:
+            dst.execute('BEGIN IMMEDIATE')
+            existing = {r[0] for r in dst.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not existing:
+                for kind,name,sql in sorted(schema, key=lambda r: r[0] != 'table'):
+                    dst.execute(sql)
+                migrations = list(src.execute('SELECT * FROM _sqlx_migrations'))
+                if migrations:
+                    dst.executemany('INSERT INTO _sqlx_migrations VALUES ('+','.join('?' for _ in migrations[0])+')', migrations)
+            for table in sorted(tables):
+                columns = list(src.execute('PRAGMA table_info("'+table+'")'))
+                if columns != list(dst.execute('PRAGMA table_info("'+table+'")')):
+                    raise Error('Ancestor history schemas differ; no conversation was moved.')
+                dst.execute('DELETE FROM "'+table+'" WHERE thread_id=?', (sid,))
+                rows = src.execute('SELECT * FROM "'+table+'" WHERE thread_id=?', (sid,))
+                dst.executemany('INSERT INTO "'+table+'" VALUES ('+','.join('?' for _ in columns)+')', rows)
+            dst.commit()
+        except BaseException:
+            dst.rollback()
+            raise
+
+
+def copy_history_lineage(source, source_home, target_home):
+    """Copy paginated ancestors without changing their account ownership.
+
+    Called while the root's writer/registry locks are held. Dependency-only
+    copies are excluded from the launcher's conversation picker. Never replace
+    an independently edited destination ancestor or read an active writer.
+    """
+    visiting = set()
+    completed = set()
+    with contextlib.ExitStack() as locks:
+        def visit(path, home):
+            with path.open() as stream:
+                meta = json.loads(stream.readline())['payload']
+            sid = str(uuid.UUID(meta['id']))
+            if sid in visiting:
+                raise Error('Cyclic paginated history lineage; no conversation was moved.')
+            if sid in completed:
+                return
+            visiting.add(sid)
+            base = meta.get('history_base')
+            if base:
+                parent = str(uuid.UUID(base['thread_id']))
+                size = base.get('end_byte_offset')
+                if type(size) is not int or size <= 0:
+                    raise Error('Unsupported paginated history boundary; no conversation was moved.')
+                candidates = list((home / 'sessions').rglob('*' + parent + '.jsonl'))
+                if len(candidates) != 1:
+                    raise Error('Missing or ambiguous source rollout for ' + parent)
+                original = candidates[0]
+                if not original.resolve().is_relative_to((home / 'sessions').resolve()):
+                    raise Error('Lineage path is outside the source session directory.')
+                if parent in visiting:
+                    raise Error('Cyclic paginated history lineage; no conversation was moved.')
+                locks.enter_context(history_writer_lock(home, parent))
+                with original.open() as stream:
+                    parent_meta = json.loads(stream.readline())['payload']
+                if parent_meta.get('id') != parent:
+                    raise Error('Source rollout ID does not match its lineage reference.')
+                visit(original, home)
+                matches = list((target_home / 'sessions').rglob('*' + parent + '.jsonl'))
+                if len(matches) > 1:
+                    raise Error('Destination contains duplicate ancestor histories.')
+                destination = matches[0] if matches else target_home / 'sessions/lineage' / original.name
+                locks.enter_context(history_writer_lock(target_home, parent))
+                if original.stat().st_size < size:
+                    raise Error('Source rollout is shorter than the required fork history.')
+                # An existing ancestor may legitimately contain additional turns.
+                # Only the immutable prefix used by this fork must match.
+                if destination.exists():
+                    remaining = size
+                    with original.open('rb') as a, destination.open('rb') as b:
+                        while remaining:
+                            chunk = a.read(min(remaining, 1024 * 1024))
+                            if not chunk or b.read(len(chunk)) != chunk:
+                                raise Error('Destination ancestor history differs; refusing to overwrite it.')
+                            remaining -= len(chunk)
+                    # A source projection is valid only for exactly the copied
+                    # rollout. Keep divergent destination ancestors untouched.
+                    if destination.read_bytes() != original.read_bytes():
+                        raise Error('Destination ancestor has different later history; resume it locally before retrying.')
+                else:
+                    private_dir(destination.parent)
+                    fd, temp = tempfile.mkstemp(dir=destination.parent)
+                    os.close(fd)
+                    try:
+                        before = original.stat()
+                        shutil.copyfile(original, temp)
+                        after = original.stat()
+                        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                            raise Error('Ancestor history changed while copying; retry when idle.')
+                        with reset_history_projection(target_home, parent):
+                            os.replace(temp, destination)
+                    finally:
+                        if os.path.exists(temp): os.unlink(temp)
+                copy_ancestor_projection(home, target_home, parent, size)
+            visiting.remove(sid)
+            completed.add(sid)
+        visit(Path(source), Path(source_home))
+
+
 def move(row, target, already_locked=False, source_home=None, quiet=False):
     require_account(target)
     if row['account'] == target and source_home is None:
@@ -709,6 +853,7 @@ def move(row, target, already_locked=False, source_home=None, quiet=False):
         source = Path(row['path'])
         if not source.resolve().is_relative_to((source_home / 'sessions').resolve()):
             raise Error('History path is outside the source session directory.')
+        copy_history_lineage(source, source_home, require_account(target))
         existing = list((require_account(target) / 'sessions').rglob('*' + row['id'] + '.jsonl'))
         if len(existing) > 1:
             raise Error('Destination contains duplicate session histories; no files were changed.')
@@ -768,6 +913,8 @@ def local_chats(source_home=None):
             pass  # Rollout discovery works without the optional title index.
     result = []
     for path in (home/'sessions').rglob('*.jsonl'):
+        if path.relative_to(home/'sessions').parts[0] == 'lineage':
+            continue
         try:
             if not path.resolve().is_relative_to((home/'sessions').resolve()): continue
             with path.open() as f: record = json.loads(f.readline(1024*1024))
@@ -939,7 +1086,8 @@ def select_ready_account(reports, preferred=None, requested=None):
     available = [r for r in reports if quota_state(r) == 'available']
     if not available:
         raise Error('No account has confirmed available quota. Check codex-accounts status; use --account NAME explicitly if limits are unavailable.')
-    return min(available, key=lambda r:(r['label'] != preferred, len(r.get('runs',[])), r.get('routing',{}).get('last_selected',0)))
+    return min(available, key=lambda r: (r['label'] != preferred,
+        drain_priority(r['label'], r.get('usage'), r.get('routing', {}), len(r.get('runs', [])))))
 
 def continue_chat(query='', account=None, source_home=None, list_only=False, as_json=False):
     rows = discover_chats(query, source_home)
@@ -1037,6 +1185,7 @@ def account_snapshot(name, timeout=8, include_usage=False, refresh_token=False):
             if include_usage:
                 try:
                     report['usage'] = request(3, 'account/rateLimits/read', {})
+                    cache_routing_usage(name, report['usage'])
                     report['checked_at'] = time.time()
                 except (Error, OSError, ValueError):
                     report['usage_error'] = 'Could not fetch live limits; check login or connection'
@@ -1552,6 +1701,19 @@ def parser():
     s = sub.add_parser('serve', help='Persistent multi-session account router (experimental)')
     s.add_argument('--socket', required=True)
     s.add_argument('--account', help='Preferred account for new chats')
+    s = sub.add_parser('resources', help='Inspect and manage idle chat servers')
+    s.add_argument('operation', nargs='?', default='status', choices=['status','prune','pin','unpin','register','release','policy'])
+    s.add_argument('session', nargs='?', help='Saved session ID or unique prefix')
+    s.add_argument('--apply', action='store_true', help='Actually unload safe idle servers; prune defaults to a preview')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--socket', help='Inspect one router, including a manually started router')
+    s.add_argument('--idle-seconds', type=int)
+    s.add_argument('--max-idle', type=int)
+    s.add_argument('--off', action='store_true', help='Disable automatic unloading')
+    s.add_argument('--on', action='store_true', help='Enable automatic unloading')
+    s.add_argument('--pid', type=int, help='Owned background process to register or release')
+    s.add_argument('--kind', choices=['preview','terminal','repl','other'], default='other')
+    s.add_argument('--lifetime', choices=['session','persistent'], default='persistent')
     s = sub.add_parser('routing', help='Rotate before ordinary quota is exhausted')
     flags = s.add_mutually_exclusive_group()
     flags.add_argument('--threshold', type=int, choices=range(1, 101), metavar='1-100',
@@ -1639,6 +1801,7 @@ def main(argv=None):
         return 0
     if args.action == 'serve':
         return serve_router(args.socket, args.account)
+    if args.action == 'resources': return resource_command(args)
     if args.action == 'routing':
         if args.threshold is not None or args.off:
             atomic_json(ROOT/'routing-policy.json', {'threshold': args.threshold})
@@ -1710,6 +1873,7 @@ import struct
 from collections import deque
 
 QUOTA_ERRORS = {'usageLimitExceeded', 'rateLimitExceeded'}
+
 def account_failure(error):
     """Classify terminal model-service errors, never tool output or item text."""
     if not isinstance(error, dict): return None
@@ -1727,7 +1891,6 @@ def account_failure(error):
             re.search(r'\b401\b', message) and 'unauthorized' in message):
         return 'authenticationFailed'
     return None
-
 
 class WebSocket:
     """Minimal RFC 6455 server transport over a private Unix-domain socket."""
@@ -1818,14 +1981,52 @@ def routing_state():
         yield state
         atomic_json(ROOT / 'routing.json', state)
 
+def quota_windows(usage):
+    usage = usage if isinstance(usage, dict) else {}
+    limits = usage.get('rateLimits') or (usage.get('rateLimitsByLimitId') or {}).get('codex') or {}
+    if not isinstance(limits, dict): return []
+    return [limits[key] for key in ('primary', 'secondary') if isinstance(limits.get(key), dict)]
+
+def cache_routing_usage(name, usage):
+    # Store only quota windows, never identity or credentials. Sparse events must
+    # not erase an already known weekly window.
+    windows = quota_windows(usage)
+    if not windows: return
+    limits = usage.get('rateLimits') or (usage.get('rateLimitsByLimitId') or {}).get('codex') or {}
+    if limits.get('limitId') not in (None, 'codex'): return
+    with routing_state() as state:
+        cached = state.setdefault(name, {}).setdefault('quota', {})
+        for key in ('primary', 'secondary'):
+            if isinstance(limits.get(key), dict):
+                cached[key] = limits[key]
+
+def current_quota_windows(usage):
+    # Passed reset times permit retry, not an assertion of replenished quota.
+    now = time.time()
+    return [w for w in quota_windows(usage)
+            if type(w.get('resetsAt')) in (int, float) and w['resetsAt'] > now]
+
+def drain_priority(name, usage, state, count=0):
+    windows = current_quota_windows(usage)
+    # The longest window is the weekly budget when both 5h and 7d are known.
+    longest = max(windows, key=lambda w: w.get('windowDurationMins') or 0, default={})
+    used = longest.get('usedPercent')
+    return (longest.get('resetsAt', float('inf')),
+            -used if type(used) in (int, float) else 0,
+            -state.get('last_selected', 0), -count, name)
+
 def eligible_accounts(exclude=()):
     with routing_state() as state:
         names = [name for name in accounts() if name not in exclude
                  and (require_account(name) / 'auth.json').is_file()
                  and state.get(name, {}).get('retry_after', 0) <= time.time()]
+        usage = {name: {'rateLimits': state.get(name, {}).get('quota', {})} for name in names}
+        names = [name for name in names if not any(
+            type(w.get('usedPercent')) in (int, float) and w['usedPercent'] >= 100
+            for w in current_quota_windows(usage[name]))]
         running = active_runs()
-        return sorted(names, key=lambda n: (sum(r['account']==n for r in running),
-                                             state.get(n, {}).get('last_selected', 0), n))
+        return sorted(names, key=lambda n: drain_priority(n, usage[n], state.get(n, {}),
+                      sum(r['account'] == n for r in running)))
 
 def mark_selected(name):
     with routing_state() as state:
@@ -1855,10 +2056,12 @@ def quota_ready_accounts(exclude=()):
     for name in choices:
         try:
             report = account_snapshot(name, include_usage=True)
-            if ordinary_quota_ready(report.get('usage'), threshold): ready.append(name)
+            if ordinary_quota_ready(report.get('usage'), threshold):
+                cache_routing_usage(name, report['usage'])
+                ready.append(name)
         except (Error, OSError, ValueError):
             continue
-    return ready
+    return [name for name in eligible_accounts(exclude) if name in ready]
 
 def mark_quota_failure(name, error, snapshot=None):
     windows = [(snapshot or {}).get(k) or {} for k in ('primary','secondary')] if error in QUOTA_ERRORS else []
@@ -1884,15 +2087,36 @@ class Backend:
         self.process.stdin.write((json.dumps(message)+'\n').encode())
         self.process.stdin.flush()
     def read(self):
-        data = os.read(self.process.stdout.fileno(), 65536)
-        if not data:
-            raise Error('Codex backend exited. Your saved conversation can be resumed.')
-        self.buffer.extend(data)
-        while b'\n' in self.buffer:
-            line, _, rest = self.buffer.partition(b'\n')
-            self.buffer[:] = rest
+        # Native JSON output can arrive in tiny writes. Drain a bounded burst
+        # instead of paying the actor's inbox wait for every fragment.
+        deadline = time.monotonic() + .01
+        received = 0
+        search_from = len(self.buffer)
+        while True:
+            data = os.read(self.process.stdout.fileno(), 65536)
+            if not data:
+                if received: break  # Deliver final complete messages before EOF.
+                raise Error('Codex backend exited. Your saved conversation can be resumed.')
+            self.buffer.extend(data)
+            received += len(data)
+            remaining = deadline - time.monotonic()
+            if received >= 1024 * 1024 or remaining <= 0: break
+            if not select.select([self.process.stdout], [], [], min(.001, remaining))[0]: break
+        consumed = 0
+        while True:
+            end = self.buffer.find(b'\n', search_from)
+            if end < 0: break
+            line = self.buffer[consumed:end]
+            consumed = search_from = end + 1
             if line.strip():
                 self.messages.append(json.loads(line))
+        if consumed: del self.buffer[:consumed]
+        # Older live actor loops wait on their inbox before every read. Wake
+        # that wait while a large reply still has bytes ready in the pipe.
+        inbox = getattr(self, 'router_inbox', None)
+        if inbox is not None and select.select([self.process.stdout], [], [], 0)[0]:
+            try: inbox.put_nowait(('backend_ready', None, None))
+            except queue.Full: pass
     def close(self):
         # This backend owns a dedicated process group. Stop its tools as well
         # as the server before handing history to the next account.
@@ -1995,7 +2219,9 @@ class AutoBridge:
             # Only adopt these options after a persistent-thread response.
             self.pending_thread_options[json.dumps(message['id'])] = {
                 k:v for k,v in params.items() if k in
-                ('model','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','personality','config')}
+                ('model','modelProvider','cwd','approvalPolicy','approvalsReviewer','sandbox',
+                 'serviceTier','personality','config','permissions','runtimeWorkspaceRoots',
+                 'baseInstructions','developerInstructions')}
         if method == 'turn/start' and self.sid and params.get('threadId') == self.sid:
             try:
                 self.prepare_turn()
@@ -2028,6 +2254,7 @@ class AutoBridge:
             return
         try:
             usage = self.rpc('account/rateLimits/read', {})
+            cache_routing_usage(self.name, usage)
         except (Error, OSError, ValueError):
             return  # Quota rotation is a preference, not a ban on credit use.
         limits = usage.get('rateLimits') or (usage.get('rateLimitsByLimitId') or {}).get('codex') or {}
@@ -2053,14 +2280,27 @@ class AutoBridge:
             self.ws.send(dict(id=json.loads(ident), error=dict(code=-32000,message='Account is reconnecting; retry this request.')))
         self.pending.clear()
         self.pending_thread_options.clear()
-        move(row, target, already_locked=True, quiet=True)
-        self.open_backend(target)
-        self.rpc('initialize', self.initialize)
-        self.backend.send(dict(method='initialized'))
         resume_options = dict(self.thread_options, threadId=self.sid)
         if row['history_mode'] == 'paginated': resume_options['excludeTurns'] = True
-        resumed = self.rpc('thread/resume', resume_options)
-        self.set_thread(resumed['thread'])
+        def reconnect(name):
+            self.open_backend(name)
+            self.rpc('initialize', self.initialize)
+            self.backend.send(dict(method='initialized'))
+            resumed = self.rpc('thread/resume', resume_options)
+            self.set_thread(resumed['thread'])
+        try:
+            move(row, target, already_locked=True, quiet=True)
+            reconnect(target)
+        except (Error, OSError, ValueError, sqlite3.Error):
+            # The source rollout was retained. A failed target resume must not
+            # leave the live TUI talking to a backend that never loaded its ID.
+            self.close_backend()
+            with lock('registry'):
+                ownership = owners()
+                ownership[row['id']] = row['account']
+                atomic_json(ROOT / 'owners.json', ownership)
+            reconnect(row['account'])
+            raise
         account = self.rpc('account/read', {'refreshToken':False}).get('account') or {}
         self.ws.send(dict(method='account/updated',params=dict(authMode='chatgpt',planType=account.get('planType'))))
     def inspect(self, message):
@@ -2086,6 +2326,7 @@ class AutoBridge:
                 self.quota_errors[params.get('turnId')] = code
         if method == 'account/rateLimits/updated':
             incoming = params.get('rateLimits') or {}
+            cache_routing_usage(self.name, {'rateLimits': incoming})
             if not self.snapshot or incoming.get('limitId') == self.snapshot.get('limitId'):
                 self.snapshot = {**(self.snapshot or {}), **{k:v for k,v in incoming.items() if v is not None}}
         if 'id' in message and not method:
@@ -2094,7 +2335,10 @@ class AutoBridge:
             if original in ('thread/start','thread/resume','thread/fork') and 'result' in message:
                 thread = message['result']['thread']
                 if not thread.get('ephemeral'):
-                    self.thread_options = options
+                    if original == 'thread/resume' and self.sid == thread['id']:
+                        self.thread_options.update(options)
+                    else:
+                        self.thread_options = options
                     self.set_thread(thread)
     def from_backend(self, message):
         self.inspect(message)
@@ -2345,12 +2589,13 @@ def adopt_bridge_runtime(bridge, runtime, lane=None):
     # Adoption occurs only in the owning actor, outside an active turn/RPC/approval.
     if bridge.phase in ('working','starting turn','waiting for input','switching account'):
         return False
-    if bridge.pending or bridge.approvals or bridge.backend.messages: return False
+    if bridge.pending or bridge.approvals or (bridge.backend and bridge.backend.messages): return False
     with runtime.mutex:
         module, fingerprint = runtime.module, runtime.fingerprint
     if getattr(bridge, '_live_generation', None) == fingerprint: return False
     bridge.__class__ = module.router_bridge_class(lane) if lane is not None else module.AutoBridge
-    if bridge.backend.__class__.__dict__.get('_live_native_backend', False):
+    if lane is not None: lane.__class__ = module.RouterLane
+    if bridge.backend and bridge.backend.__class__.__dict__.get('_live_native_backend', False):
         bridge.backend.__class__ = module.Backend
     if bridge.factory is Backend or bridge.factory.__dict__.get('_live_native_backend', False):
         bridge.factory = module.Backend
@@ -2360,8 +2605,11 @@ def adopt_bridge_runtime(bridge, runtime, lane=None):
 
 def router_bridge_class(lane):
     class Bridge(AutoBridge):
+        def inspect(self, message):
+            super().inspect(message)
+            lane.observe(message)
         def update_marker(self):
-            if self.sid and not lane.control: super().update_marker()
+            if self.sid and self.backend and not lane.control: super().update_marker()
         def open_backend(self, name):
             lane.generation += 1
             super().open_backend(name)
@@ -2385,16 +2633,379 @@ def router_bridge_class(lane):
 
 Backend._live_native_backend = True
 
+def resource_policy():
+    policy = dict(enabled=True, idle_seconds=600, max_idle=6)
+    policy.update(read_json(ROOT/'resource-policy.json', {}) or {})
+    if type(policy['enabled']) is not bool or any(
+            type(policy[k]) is not int or policy[k] < 0 for k in ('idle_seconds','max_idle')):
+        raise Error('Invalid resource policy.')
+    return policy
+
+def resource_preferences(sid):
+    return (read_json(ROOT/'resource-preferences.json', {}) or {}).get(sid, {})
+
+def process_resources():
+    """RSS only; no command arguments, prompts, or credentials in diagnostics."""
+    result = subprocess.run(['ps','-ww','-A','-o','pid=,ppid=,rss=,lstart=,comm='],
+                            capture_output=True, text=True, timeout=5, check=True)
+    rows = {}
+    for line in result.stdout.splitlines():
+        f = line.strip().split(None, 8)
+        if len(f) == 9:
+            rows[int(f[0])] = dict(parent=int(f[1]), rss_kb=int(f[2]),
+                                  identity=' '.join(f[3:8]), name=Path(f[8]).name)
+    return rows
+
+def process_descendants(rows, pid):
+    found, pending = set(), [pid]
+    children = {}
+    for child, row in rows.items(): children.setdefault(row['parent'], []).append(child)
+    while pending:
+        child = pending.pop()
+        if child in found: continue
+        found.add(child)
+        pending.extend(children.get(child, []))
+    return found
+
+def resource_router_records():
+    records = []
+    for path in (ROOT/'resource-routers').glob('*.json'):
+        try:
+            row = read_json(path, {})
+            if time.time()-row.get('updated', 0) < 30 and row.get('pid', 0) > 0 and alive(row['pid']):
+                records.append(row)
+        except (OSError, ValueError, TypeError): pass
+    return records
+
+def resource_rpc(address, method, params):
+    """Short-lived local diagnostic connection; never starts a router."""
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(45)
+        sock.connect(str(address))
+        stream = sock.makefile('rwb')
+        try:
+            deadline = time.monotonic()+40
+            for ident, name, value in [(1, 'initialize', {'clientInfo':{'name':'codexx_resources','version':VERSION}}),
+                                       (2, method, params)]:
+                stream.write((json.dumps({'id':ident,'method':name,'params':value})+'\n').encode())
+                stream.flush()
+                while True:
+                    remaining = deadline-time.monotonic()
+                    if remaining <= 0: raise Error('Router diagnostics timed out.')
+                    sock.settimeout(remaining)
+                    line = stream.readline()
+                    if not line: raise Error('Router disconnected.')
+                    message = json.loads(line)
+                    if message.get('id') != ident: continue
+                    if 'error' in message: raise Error(message['error'].get('message','Router request failed.'))
+                    break
+            return message['result']
+        finally: stream.close()
+
+def resource_router_addresses():
+    addresses = {r['socket'] for r in resource_router_records() if r.get('socket')}
+    desktop = read_json(ROOT/'desktop/settings.json', {}).get('socket')
+    if desktop: addresses.add(desktop)
+    digest = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
+    addresses.add('/tmp/codexx-'+str(os.getuid())+'-'+digest+'/router.sock')
+    # Also report older routers that predate the heartbeat registry, including
+    # a Desktop router left behind after its configured socket changed.
+    result = subprocess.run(['ps','-ww','-u',str(os.getuid()),'-o','args='],
+                            capture_output=True, text=True, timeout=5, check=True)
+    for line in result.stdout.splitlines():
+        if 'codex-accounts' not in line or '--socket' not in line: continue
+        try: tokens = shlex.split(line)
+        except ValueError: continue
+        if (len(tokens) > 4 and Path(tokens[1]).name == 'codex-accounts'
+                and tokens[2] == 'serve' and '--socket' in tokens[3:-1]):
+            address = tokens[tokens.index('--socket',3)+1]
+            # Socket names generated by this home embed its hash. Arbitrary
+            # sockets require --socket so isolated homes never inspect another.
+            if digest[:8] in str(Path(address).parent):
+                addresses.add(address)
+    return {str(Path(address).resolve()) for address in addresses}
+
+def resource_command(args):
+    operation = args.operation
+    if args.apply and operation != 'prune': raise Error('--apply is only valid with prune.')
+    if operation != 'policy' and any((args.on, args.off, args.idle_seconds is not None, args.max_idle is not None)):
+        raise Error('Resource limits and --on/--off require the policy command.')
+    if args.on and args.off: raise Error('Choose --on or --off.')
+    if operation == 'policy':
+        with lock('resource-policy'):
+            policy = resource_policy()
+            for key in ('idle_seconds','max_idle'):
+                value = getattr(args, key)
+                if value is not None:
+                    if value < 0: raise Error('Resource limits must be nonnegative.')
+                    policy[key] = value
+            if args.on or args.off: policy['enabled'] = args.on
+            atomic_json(ROOT/'resource-policy.json', policy)
+        print(json.dumps(policy, indent=2))
+        return 0
+    if operation in ('pin','unpin','register','release'):
+        if not args.session: raise Error('Specify a saved session ID.')
+        sid = choose_session(args.session)['id']
+        with lock('resource-preferences'):
+            preferences = read_json(ROOT/'resource-preferences.json', {}) or {}
+            entry = preferences.setdefault(sid, {})
+            if operation in ('pin','unpin'):
+                entry['pinned'] = operation == 'pin'
+            elif operation == 'release':
+                if not args.pid: raise Error('Specify --pid.')
+                entry['resources'] = [r for r in entry.get('resources', []) if r['pid'] != args.pid]
+            else:
+                rows = process_resources()
+                if not args.pid or args.pid not in rows: raise Error('Specify a live --pid.')
+                owned = False
+                for router in resource_router_records():
+                    for lane in router.get('lanes', []):
+                        backend = lane.get('pid')
+                        if lane.get('session') == sid and backend and args.pid != backend:
+                            owned |= args.pid in process_descendants(rows, backend)
+                if not owned: raise Error('Process is not a known descendant of this managed chat server.')
+                resources = [r for r in entry.get('resources', []) if r['pid'] != args.pid]
+                resources.append(dict(pid=args.pid, identity=rows[args.pid]['identity'],
+                                      kind=args.kind, lifetime=args.lifetime))
+                entry['resources'] = resources
+            atomic_json(ROOT/'resource-preferences.json', preferences)
+        print(json.dumps(dict(session=sid, **entry), indent=2))
+        return 0
+    addresses = {str(Path(args.socket).resolve())} if args.socket else resource_router_addresses()
+    sid = choose_session(args.session)['id'] if args.session else None
+    reports = []
+    for address in sorted(addresses):
+        if not Path(address).exists(): continue
+        try:
+            status = resource_rpc(address, 'codexx/status', {})
+            if not status.get('resourceManagement'):
+                reports.append(dict(socket=address, legacy=True,
+                    loaded_servers=sum(not row.get('stopped') for row in status.get('lanes',[])),
+                    message='This router needs a restart between jobs to enable resource management.'))
+                continue
+            if operation == 'prune':
+                status = resource_rpc(address, 'codexx/resources/prune', {'apply':args.apply,'threadId':sid})
+            reports.append(dict(socket=address, **status))
+        except (OSError, Error, ValueError) as exc:
+            reports.append(dict(socket=address, error=str(exc)))
+    if args.json:
+        print(json.dumps({'routers':reports,'policy':resource_policy()}, indent=2))
+    else:
+        if not reports: print('No running routers found.')
+        for report in reports:
+            print(report['socket'])
+            if report.get('legacy') or report.get('error'):
+                print('  '+report.get('message', report.get('error','')))
+            for lane in report.get('lanes', report.get('results', [])):
+                if sid and lane.get('session') != sid: continue
+                rss = lane.get('rss_kb')
+                memory = f'{rss/1024:.0f} MB RSS' if rss is not None else 'RSS unavailable'
+                reason = ', '.join(lane.get('blockers', [])) or lane.get('result','eligible for safety check')
+                print('  '+str(lane.get('session') or '(control)')+'  '+lane.get('state','')+
+                      '  '+memory+'  '+reason)
+        if operation == 'prune' and not args.apply: print('Preview only. Use --apply to unload sessions that pass all safety checks.')
+        if operation == 'prune' and any(report.get('remaining',0) for report in reports):
+            print('More servers remain; repeat prune for the next bounded batch.')
+    return 1 if any(r.get('error') for r in reports) else 0
+
 class RouterLane:
-    def __init__(self, router, account, initialize, control=False):
+    def __init__(self, router, account, initialize, control=False, resume_descriptor=None):
         self.router, self.control = router, control
         self.inbox = queue.Queue(maxsize=1024)
         self.ready = Future()
         self.stopped = threading.Event()
         self.generation = 0
         self.bridge = None
+        self.state = 'starting'
+        self.last_activity = time.time()
+        self.last_check = 0
+        self.blockers = []
+        self.items = set()
+        self.volatile = set()
+        self.processes = set()
+        self.settings = {}
+        self.setting_requests = {}
+        self.maintenance_pending = False
+        self.resume_descriptor = resume_descriptor
         self.thread = threading.Thread(target=self.run, args=(account, initialize), daemon=True)
         self.thread.start()
+
+    def observe(self, message):
+        method = message.get('method', '')
+        params = message.get('params') or {}
+        item = params.get('item') or {}
+        key = (params.get('threadId'), item.get('id'))
+        if method == 'item/started':
+            self.items.add(key)
+            tool = str(item.get('namespace',''))+'.'+str(item.get('tool',''))
+            if 'node_repl' in tool or 'python' in tool:
+                self.volatile.add('stateful_tool')
+        elif method == 'item/completed': self.items.discard(key)
+        elif method == 'process/exited': self.processes.discard(params.get('processId'))
+        elif method == 'thread/realtime/started': self.volatile.add('realtime')
+        elif method == 'thread/realtime/closed': self.volatile.discard('realtime')
+        elif method == 'thread/status/changed' and self.bridge and params.get('threadId') == self.bridge.sid:
+            status = (params.get('status') or {}).get('type')
+            if status == 'active' and self.bridge.phase not in ('starting turn','waiting for input'):
+                self.bridge.phase = 'working'
+            elif status == 'idle' and not self.bridge.approvals:
+                self.bridge.phase = 'idle'
+        if method.startswith(('turn/', 'item/')) or method == 'thread/queue/changed':
+            self.last_activity = time.time()
+        if not method and 'id' in message:
+            options = self.setting_requests.pop(json.dumps(message['id']), None)
+            if options and 'error' not in message: self.settings.update(options)
+
+    def blockers_now(self):
+        bridge = self.bridge
+        if self.control: return ['control_server']
+        if self.state == 'sleeping': return ['already_sleeping']
+        if not bridge or not bridge.sid: return ['unsaved_session']
+        blockers = []
+        if bridge.phase not in ('idle','completed','interrupted','failed'): blockers.append('phase:'+bridge.phase)
+        if bridge.pending or not self.inbox.empty(): blockers.append('pending_requests')
+        if bridge.approvals: blockers.append('approval_or_user_input')
+        if self.items: blockers.append('unfinished_items')
+        if self.processes: blockers.append('spawned_process')
+        blockers.extend(sorted(self.volatile))
+        if bridge.backend and (bridge.backend.messages or getattr(bridge.backend,'buffer',b'')):
+            blockers.append('pending_backend_messages')
+        if resource_preferences(bridge.sid).get('pinned'): blockers.append('pinned')
+        return blockers
+
+    def snapshot(self, rows=None):
+        bridge = self.bridge
+        pid = getattr(getattr(bridge.backend if bridge else None,'process',None),'pid',None)
+        rss = None
+        if rows is not None and pid in rows:
+            rss = sum(rows[p]['rss_kb'] for p in process_descendants(rows,pid) if p in rows)
+        return dict(session=bridge.sid if bridge else None, pid=pid, state=self.state,
+                    control=self.control, account=bridge.name if bridge else None,
+                    last_activity=self.last_activity, idle_seconds=max(0,time.time()-self.last_activity),
+                    blockers=list(dict.fromkeys(self.blockers_now()+self.blockers)),
+                    last_check=self.last_check, rss_kb=rss,
+                    stopped=self.stopped.is_set(),
+                    pending=list(bridge.pending.values()) if bridge else [],
+                    buffered_bytes=len(getattr(bridge.backend if bridge else None,'buffer',b'')),
+                    queued_requests=self.inbox.qsize())
+
+    def check_idle(self):
+        """Runs only in the owning actor. A missing capability fails closed."""
+        blockers = self.blockers_now()
+        if blockers: return blockers
+        bridge = self.bridge
+        try:
+            choose_session(bridge.sid)
+            rows = process_resources()
+            registered = resource_preferences(bridge.sid).get('resources', [])
+            disposable = {r['pid'] for r in registered if r['lifetime'] == 'session'
+                          and rows.get(r['pid'],{}).get('identity') == r['identity']}
+            loaded = bridge.rpc('thread/loaded/list', {}, timeout=3)
+            ids = loaded.get('data')
+            if not isinstance(ids,list) or bridge.sid not in ids: return ['unknown_loaded_threads']
+            for sid in ids:
+                thread = bridge.rpc('thread/read', {'threadId':sid,'includeTurns':False}, timeout=3).get('thread',{})
+                if (thread.get('status') or {}).get('type') != 'idle': return ['thread_not_idle']
+                if thread.get('ephemeral'): return ['ephemeral_thread']
+                terminals = bridge.rpc('thread/backgroundTerminals/list', {'threadId':sid}, timeout=3)
+                if not isinstance(terminals.get('data'),list): return ['unknown_background_jobs']
+                if any(t.get('osPid') not in disposable for t in terminals['data']) or terminals.get('nextCursor'):
+                    return ['background_terminal']
+                queued = bridge.rpc('thread/queue/list', {'threadId':sid}, timeout=3)
+                if not isinstance(queued.get('data'),list): return ['unknown_queued_work']
+                if queued['data'] or queued.get('nextCursor'): return ['queued_work']
+                goal = bridge.rpc('thread/goal/get', {'threadId':sid}, timeout=3)
+                if 'goal' not in goal: return ['unknown_goal']
+                if goal['goal'] and goal['goal'].get('status') not in ('complete','paused','blocked','budgetLimited'):
+                    return ['continuing_goal']
+            pid = getattr(bridge.backend.process,'pid',None)
+            if pid is not None:
+                if pid not in rows: return ['unknown_process_tree']
+                descendants = process_descendants(rows,pid)
+                if any(rows[p]['name'] in ('node_repl', 'ipython', 'ipykernel_launcher')
+                       for p in descendants if p in rows):
+                    return ['stateful_runtime']
+            for resource in resource_preferences(bridge.sid).get('resources', []):
+                current = rows.get(resource['pid'])
+                if current and current['identity'] == resource['identity'] and resource['lifetime'] == 'persistent':
+                    return ['persistent_'+resource['kind']]
+            # Probe RPCs may deliver late notifications. Recheck before closing.
+            if select.select([bridge.backend.process.stdout],[],[],0)[0]:
+                bridge.backend.read()
+            while bridge.backend.messages:
+                bridge.from_backend(bridge.backend.messages.popleft())
+            return self.blockers_now()
+        except (Error, OSError, ValueError, subprocess.SubprocessError):
+            return ['safety_check_unavailable']
+
+    def unload(self, apply=False):
+        self.last_check = time.time()
+        self.blockers = self.check_idle()
+        if self.blockers: return dict(self.snapshot(), result='kept')
+        if not apply: return dict(self.snapshot(), result='would_unload')
+        bridge = self.bridge
+        descriptor = dict(threadId=bridge.sid, initialize=bridge.initialize,
+                          thread_options=bridge.thread_options, settings=self.settings)
+        atomic_json(ROOT/'dormant'/(bridge.sid+'.json'), descriptor)
+        self.state = 'unloading'
+        preferences = resource_preferences(bridge.sid)
+        bridge.close_backend()
+        if bridge.session_lock:
+            bridge.session_lock.__exit__(None,None,None)
+            bridge.session_lock = None
+        bridge.marker.unlink(missing_ok=True)
+        # Explicitly session-scoped resources may have detached from the group.
+        rows = process_resources() if preferences.get('resources') else {}
+        for resource in preferences.get('resources', []):
+            current = rows.get(resource['pid'])
+            if resource['lifetime'] == 'session' and current and current['identity'] == resource['identity']:
+                with contextlib.suppress(OSError): os.kill(resource['pid'], signal.SIGTERM)
+        self.state = 'sleeping'
+        bridge.phase = 'sleeping'
+        self.blockers = []
+        return dict(self.snapshot(), result='unloaded')
+
+    def wake(self):
+        if self.state != 'sleeping': return
+        bridge = self.bridge
+        sid = bridge.sid
+        self.state = 'waking'
+        try:
+            row = choose_session(sid)
+            acquired = lock('session-'+sid)
+            acquired.__enter__()
+            bridge.session_lock = acquired
+            bridge.phase = 'starting'
+            bridge.open_backend(row['account'])
+            bridge.rpc('initialize', bridge.initialize)
+            bridge.backend.send({'method':'initialized'})
+            options = dict(bridge.thread_options, threadId=sid)
+            if row['history_mode'] == 'paginated': options['excludeTurns'] = True
+            result = bridge.rpc('thread/resume', options)
+            bridge.set_thread(result['thread'])
+            if self.settings:
+                bridge.rpc('thread/settings/update', dict(self.settings, threadId=sid))
+            self.state = 'loaded'
+            self.blockers = []
+            self.last_check = 0
+            (ROOT/'dormant'/(sid+'.json')).unlink(missing_ok=True)
+        except Exception:
+            bridge.close_backend()
+            if bridge.session_lock:
+                bridge.session_lock.__exit__(None,None,None)
+                bridge.session_lock = None
+            bridge.phase = 'sleeping'
+            bridge.marker.unlink(missing_ok=True)
+            self.state = 'sleeping'
+            raise
+
+    def request_unload(self, apply=False):
+        result = Future()
+        if self.stopped.is_set():
+            result.set_result(dict(self.snapshot(), result='stopped'))
+            return result
+        self.inbox.put_nowait(('unload', apply, result))
+        return result
 
     def send(self, message):
         self.router.output(self, message)
@@ -2417,22 +3028,63 @@ class RouterLane:
             self.bridge.initialize = initialize
             response = self.bridge.rpc('initialize', initialize)
             self.bridge.backend.send({'method':'initialized'})
+            if self.resume_descriptor:
+                descriptor = self.resume_descriptor
+                self.bridge.thread_options = dict(descriptor['thread_options'])
+                sid = descriptor['threadId']
+                options = dict(self.bridge.thread_options, threadId=sid)
+                if choose_session(sid)['history_mode'] == 'paginated': options['excludeTurns'] = True
+                result = self.bridge.rpc('thread/resume', options)
+                self.bridge.set_thread(result['thread'])
+                self.settings = dict(descriptor.get('settings',{}))
+                if self.settings:
+                    self.bridge.rpc('thread/settings/update', dict(self.settings, threadId=sid))
+                (ROOT/'dormant'/(sid+'.json')).unlink(missing_ok=True)
             self.ready.set_result(response)
+            self.state = 'loaded'
             while not self.stopped.is_set():
                 try:
-                    kind, value, future = self.inbox.get(timeout=.02)
+                    active = self.bridge.phase in ('working','starting turn','waiting for input','switching account')
+                    delay = 1 if self.state == 'sleeping' else (.02 if active else .2)
+                    if self.bridge.backend and self.bridge.backend.messages: delay = 0
+                    if (self.bridge.backend and select.select(
+                            [self.bridge.backend.process.stdout], [], [], 0)[0]):
+                        delay = 0
+                    kind, value, future = self.inbox.get(timeout=delay)
                 except queue.Empty:
                     kind = None
-                if kind == 'rpc':
+                if kind == 'unload':
+                    try: future.set_result(self.unload(value))
+                    except Exception as exc: future.set_exception(exc)
+                    finally: self.maintenance_pending = False
+                elif kind == 'rpc':
                     try: future.set_result(self.bridge.rpc(*value))
                     except Exception as exc: future.set_exception(exc)
                 elif kind == 'send':
                     self.router.runtime.refresh()
                     adopt_bridge_runtime(self.bridge, self.router.runtime, self)
-                    self.bridge.from_client(value)
-                while self.bridge.backend.messages:
+                    try:
+                        self.wake()
+                        method = value.get('method','')
+                        if method not in ('thread/read','thread/loaded/list','account/read','account/rateLimits/read'):
+                            self.last_activity = time.time()
+                        if method in ('thread/settings/update','turn/start') and 'id' in value:
+                            self.setting_requests[json.dumps(value['id'])] = {
+                                k:v for k,v in value.get('params',{}).items() if k in
+                                ('approvalPolicy','approvalsReviewer','collaborationMode','cwd','disabledPluginIds',
+                                 'effort','model','multiAgentMode','permissions','personality','sandboxPolicy',
+                                 'serviceTier','summary')}
+                        if value.get('params',{}).get('dynamicTools'):
+                            self.volatile.add('dynamic_tools')
+                        if method == 'process/spawn':
+                            self.processes.add(value.get('params',{}).get('processId','unknown'))
+                        self.bridge.from_client(value)
+                    except (Error, OSError, ValueError) as exc:
+                        if 'id' in value:
+                            self.send({'id':value['id'],'error':{'code':-32000,'message':str(exc)}})
+                while self.bridge.backend and self.bridge.backend.messages:
                     self.bridge.from_backend(self.bridge.backend.messages.popleft())
-                if select.select([self.bridge.backend.process.stdout], [], [], .02)[0]:
+                if self.bridge.backend and select.select([self.bridge.backend.process.stdout], [], [], .02)[0]:
                     self.bridge.backend.read()
                 self.router.runtime.refresh()
                 adopt_bridge_runtime(self.bridge, self.router.runtime, self)
@@ -2445,6 +3097,8 @@ class RouterLane:
             while not self.inbox.empty():
                 _, _, future = self.inbox.get_nowait()
                 if future and not future.done(): future.set_exception(Error('Backend stopped.'))
+            with self.router.mutex:
+                self.router.lanes.discard(self)
 
     def close(self):
         self.stopped.set()
@@ -2466,6 +3120,70 @@ class MultiRouter:
         self.pages = {}
         self.initialize = None
         self.closed = False
+        self.resource_identity = str(uuid.uuid4())
+        self.resource_checked = 0
+        self.resource_address = None
+
+    def resource_status(self):
+        try: rows = process_resources()
+        except (OSError, ValueError, subprocess.SubprocessError): rows = None
+        with self.mutex:
+            lanes = [lane.snapshot(rows) for lane in self.lanes if not lane.stopped.is_set()]
+        return dict(resourceManagement=True, lanes=lanes, policy=resource_policy(),
+                    memoryMetric='rss_kb (resident only; excludes compressed and swapped memory)')
+
+    def maintain_resources(self, address=None, force=False):
+        now = time.time()
+        if address: self.resource_address = address
+        if not force and now-self.resource_checked < 5: return
+        self.resource_checked = now
+        status = self.resource_status()
+        record = dict(pid=os.getpid(), updated=now, socket=self.resource_address, **status)
+        atomic_json(ROOT/'resource-routers'/(self.resource_identity+'.json'), record)
+        policy = status['policy']
+        if not policy['enabled']: return
+        candidates = []
+        for router in resource_router_records():
+            for row in router['lanes']:
+                if row['state'] != 'loaded' or row['control']: continue
+                # The owning actor will revalidate these candidates. A previous
+                # failed probe is retried at most once per minute.
+                if now-row.get('last_check',0) < 60: continue
+                if any(b.startswith(('phase:','pending_','approval','unfinished','pinned',
+                                     'stateful','realtime','spawned','unsaved')) for b in row['blockers']): continue
+                candidates.append(row)
+        candidates.sort(key=lambda row: row['last_activity'])
+        over = max(0, len(candidates)-policy['max_idle'])
+        selected = {r['session'] for i,r in enumerate(candidates)
+                    if i < over or now-r['last_activity'] >= policy['idle_seconds']}
+        with self.mutex:
+            eligible = sorted(self.lanes, key=lambda lane: lane.last_activity)
+            count = 0
+            for lane in eligible:
+                if (lane.bridge and lane.bridge.sid in selected and not lane.maintenance_pending
+                        and lane.state == 'loaded' and not lane.stopped.is_set()):
+                    lane.maintenance_pending = True
+                    try: lane.request_unload(True)
+                    except queue.Full: lane.maintenance_pending = False
+                    count += 1
+                    if count == 2: break
+
+    def prune_resources(self, params):
+        with self.mutex:
+            lanes = [lane for lane in self.lanes if not lane.control and not lane.stopped.is_set()
+                     and (not params.get('threadId') or (lane.bridge and lane.bridge.sid == params['threadId']))]
+        # Bounded batches keep a manual request responsive even with hundreds
+        # of legacy sessions. Automatic maintenance continues independently.
+        lanes.sort(key=lambda lane: (lane.last_check, lane.last_activity))
+        selected = [lane for lane in lanes if lane.state == 'loaded'][:8]
+        pending = [(lane, lane.request_unload(params.get('apply') is True)) for lane in selected]
+        results = []
+        deadline = time.monotonic()+35
+        for lane, future in pending:
+            try: results.append(future.result(timeout=max(.01,deadline-time.monotonic())))
+            except Exception:
+                results.append(dict(lane.snapshot(), result='check_pending'))
+        return dict(results=results, remaining=sum(lane.state == 'loaded' for lane in lanes if lane not in selected))
 
     def available(self):
         choices = eligible_accounts()
@@ -2475,11 +3193,11 @@ class MultiRouter:
         if not choices: raise Error('No accounts are ready. Add an account or wait for quota to reset.')
         return choices
 
-    def lane(self, account, control=False, initialize=None):
+    def lane(self, account, control=False, initialize=None, resume_descriptor=None):
         if self.closed: raise Error('Router is shutting down.')
         options = dict(initialize or self.initialize)
         options['capabilities'] = dict(options.get('capabilities') or {}, experimentalApi=True)
-        lane = RouterLane(self, account, options, control)
+        lane = self.runtime.module.RouterLane(self, account, options, control, resume_descriptor)
         self.lanes.add(lane)
         return lane
 
@@ -2492,8 +3210,23 @@ class MultiRouter:
         return self.controls[name]
 
     def reply(self, client, message):
-        try: client.send(message)
-        except (OSError, EOFError): self.clients.discard(client)
+        transport = getattr(getattr(client, 'ws', None), 'sock', None)
+        try:
+            # Never wait for a socket reader while holding the routing mutex.
+            # Existing live clients acquire their writer lazily after an update.
+            if transport is not None:
+                RouterClient.enqueue(client, message)
+            else:
+                client.send(message)
+        except (OSError, EOFError):
+            self.clients.discard(client)
+            # sendall may already have written part of a JSON line/frame.
+            # Further replies would concatenate onto that truncated message.
+            # Shut down both directions to wake the reader and force reconnect;
+            # session backends remain owned by the router.
+            if transport is not None:
+                try: transport.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
 
     def notice(self, sid, text):
         # Standard error notification, scoped to the affected conversation.
@@ -2546,6 +3279,8 @@ class MultiRouter:
         with self.mutex:
             self.clients.discard(client)
             self.client_initializes.pop(client, None)
+            if getattr(getattr(client, 'ws', None), 'sock', None) is not None:
+                RouterClient.close(client)
             # Keep actors alive; replies to departed clients are dropped.
             for ident, pending in list(self.requests.items()):
                 if pending[0] is client:
@@ -2556,6 +3291,15 @@ class MultiRouter:
         with self.mutex:
             self.__class__ = module.MultiRouter
             if self.factory.__dict__.get('_live_native_backend', False): self.factory = module.Backend
+            # Reader upgrades only use existing buffer/messages/pipe state and
+            # are safe between reads, even while a large reply is incomplete.
+            # Waiting for bridge.pending to empty would strand that reply on
+            # the old reader. Executing calls retain their current function.
+            for lane in self.lanes:
+                backend = lane.bridge.backend if lane.bridge else None
+                if backend and backend.__class__.__dict__.get('_live_native_backend', False):
+                    backend.read = types.MethodType(module.Backend.read, backend)
+                    backend.router_inbox = getattr(lane, 'inbox', None)
         if self.closed: raise Error('Router is shutting down.')
         method, params = message.get('method'), message.get('params') or {}
         ident = message.get('id')
@@ -2575,6 +3319,13 @@ class MultiRouter:
                     if generation == lane.generation: self.reply(client, pending)
             return
         if client not in self.clients: raise Error('Initialize this connection first.')
+        if method == 'codexx/status':
+            # Local transport diagnostics: no prompts, credentials or history.
+            self.reply(client, {'id':ident, 'result':self.resource_status()})
+            return
+        if method == 'codexx/resources/prune':
+            self.reply(client, {'id':ident, 'result':self.prune_resources(params)})
+            return
         if not method:
             with self.mutex:
                 pending = self.approvals.pop(ident, None)
@@ -2590,20 +3341,25 @@ class MultiRouter:
             return
         if method == 'thread/loaded/list':
             with self.mutex:
-                ids = [sid for sid,lane in self.sessions.items() if not lane.stopped.is_set()]
+                ids = [sid for sid,lane in self.sessions.items()
+                       if not lane.stopped.is_set() and lane.state == 'loaded']
                 self.reply(client, {'id':ident,'result':{'data':ids}})
             return
         with self.mutex:
             sid = params.get('threadId')
             lane = self.sessions.get(sid)
             if lane and lane.stopped.is_set(): lane = None
+            if lane and lane.state == 'sleeping' and method == 'thread/read':
+                lane = self.control(choose_session(sid)['account'])
             if method == 'thread/start' or (method == 'thread/fork' and not params.get('ephemeral')):
                 account = choose_session(sid)['account'] if sid else self.available()[0]
                 lane = self.lane(account, initialize=self.client_initializes[client])
             elif sid and lane is None:
                 row = choose_session(sid)
-                if method == 'thread/resume':
-                    lane = self.lane(row['account'], initialize=self.client_initializes[client])
+                descriptor = read_json(ROOT/'dormant'/(row['id']+'.json'))
+                if method == 'thread/resume' or (descriptor and method == 'turn/start'):
+                    lane = self.lane(row['account'], initialize=self.client_initializes[client],
+                                     resume_descriptor=descriptor)
                     self.sessions[sid] = lane
                 elif method.startswith('turn/') or method == 'thread/compact/start':
                     raise Error('Resume this conversation before starting or steering a turn.')
@@ -2665,9 +3421,13 @@ class MultiRouter:
         with self.mutex:
             self.closed = True
             lanes = list(self.lanes)
+            for client in list(self.clients):
+                if getattr(getattr(client, 'ws', None), 'sock', None) is not None:
+                    RouterClient.close(client)
             for lane in lanes: lane.stopped.set()
         for lane in lanes: lane.close()
         self.runtime.close()
+        (ROOT/'resource-routers'/(self.resource_identity+'.json')).unlink(missing_ok=True)
 
 class JsonSocket:
     """Native app-server proxy uses newline JSON on its control socket."""
@@ -2678,12 +3438,18 @@ class JsonSocket:
     def read(self):
         data=self.sock.recv(65536)
         if not data: raise EOFError
+        search_from = len(self.buffer)
         self.buffer.extend(data)
         if len(self.buffer)>64*1024*1024: raise Error('Oversized protocol message.')
         result=[]
-        while b'\n' in self.buffer:
-            line,_,rest=self.buffer.partition(b'\n');self.buffer[:]=rest
+        consumed = 0
+        while True:
+            end = self.buffer.find(b'\n', search_from)
+            if end < 0: break
+            line = self.buffer[consumed:end]
+            consumed = search_from = end + 1
             if line.strip(): result.append(json.loads(line))
+        if consumed: del self.buffer[:consumed]
         return result
 
 class RouterClient:
@@ -2691,6 +3457,52 @@ class RouterClient:
         self.ws, self.mutex = ws, threading.Lock()
     def send(self, message):
         with self.mutex: self.ws.send(message)
+
+    def enqueue(self, message):
+        if not hasattr(self, 'outbox'):
+            with self.mutex:
+                if not hasattr(self, 'outbox'):
+                    self.writer_stopped = threading.Event()
+                    # Native turns can emit hundreds of small notifications in
+                    # one burst before the writer gets a scheduling timeslice.
+                    self.outbox = queue.Queue(maxsize=1024)
+                    self.ws.sock.settimeout(45)
+                    self.writer = threading.Thread(target=RouterClient.write_replies,
+                                                   args=(self,), daemon=True)
+                    self.writer.start()
+        if self.writer_stopped.is_set(): raise EOFError
+        try: self.outbox.put_nowait(message)
+        except queue.Full:
+            RouterClient.close(self)
+            raise EOFError from None
+
+    def write_replies(self):
+        try:
+            while not self.writer_stopped.is_set():
+                try: message = self.outbox.get(timeout=.5)
+                except queue.Empty: continue
+                if self.writer_stopped.is_set(): break
+                self.send(message)
+                # A plugin/history reply can be tens of MB. Do not retain the
+                # last response while this client is idle waiting for another.
+                del message
+        except (OSError, EOFError, ValueError):
+            pass
+        finally:
+            RouterClient.close(self)
+
+    def close(self):
+        stopped = getattr(self, 'writer_stopped', None)
+        if stopped is not None: stopped.set()
+        # A timed-out send may have written a partial JSON line/frame. Shutdown
+        # wakes both the sender and the connection reader; never append to it.
+        try: self.ws.sock.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        outbox = getattr(self, 'outbox', None)
+        if outbox is not None:
+            while True:
+                try: outbox.get_nowait()
+                except queue.Empty: break
 
 def serve_router(address, preferred=None):
     path=Path(address).expanduser().resolve()
@@ -2737,6 +3549,9 @@ def _serve_router(address, preferred=None):
         print('Multi-session router listening on '+str(path),file=sys.stderr,flush=True)
         while not stopping.is_set():
             router.runtime.refresh()
+            try: router.maintain_resources(str(path))
+            except (Error, OSError, ValueError, subprocess.SubprocessError) as exc:
+                print('Resource maintenance deferred: '+str(exc), file=sys.stderr)
             try: sock,_=listener.accept()
             except socket.timeout: continue
             thread=threading.Thread(target=connected,args=(sock,),daemon=True)

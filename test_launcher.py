@@ -186,6 +186,29 @@ class LauncherTests(unittest.TestCase):
         self.quiet_move(app.choose_session(self.sid), 'work')
         self.assertEqual(app.choose_session(self.sid)['account'], 'work')
 
+    def test_move_allows_unidentified_cli_to_continue(self):
+        marker = app.ROOT/'runs/active.json'
+        run = dict(pid=os.getpid(), account='personal', session=None)
+        app.atomic_json(marker, run)
+        original = self.path.read_bytes()
+        self.quiet_move(app.choose_session(self.sid), 'work')
+        moved = app.choose_session(self.sid)
+        self.assertEqual(moved['account'], 'work')
+        self.assertEqual(Path(moved['path']).read_bytes(), original)
+        self.assertEqual(app.read_json(marker), run)
+
+    def test_unidentified_cli_cannot_bypass_native_writer_lock(self):
+        app.atomic_json(app.ROOT/'runs/active.json',
+                        dict(pid=os.getpid(), account='personal', session=None))
+        original = self.path.read_bytes()
+        for name in ('personal', 'work'):
+            with self.subTest(account=name), app.history_writer_lock(app.account_home(name), self.sid):
+                with self.assertRaisesRegex(app.Error, 'Codex is using this conversation'):
+                    self.quiet_move(app.choose_session(self.sid), 'work')
+                self.assertEqual(self.path.read_bytes(), original)
+                self.assertFalse(app.owners())
+                self.assertFalse(list((app.account_home('work')/'sessions').rglob('*.jsonl')))
+
     def test_unknown_history_move_fails_without_changes(self):
         row = app.choose_session(self.sid)
         row['history_mode']='future-format'

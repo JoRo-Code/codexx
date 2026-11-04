@@ -23,6 +23,9 @@ with tempfile.TemporaryDirectory() as tmp:
     # move requires a connected destination; remove the placeholder before starting Codex.
     auth = app.account_home('b') / 'auth.json'
     auth.write_text('{}')
+    # A live CLI without a registered thread must not block unrelated moves.
+    app.atomic_json(app.ROOT/'runs/unidentified.json',
+                    dict(pid=os.getpid(), account='a', session=None))
     directory = app.account_home('a') / 'sessions/2026/09/29'
     directory.mkdir(parents=True)
     history = directory / f'rollout-2026-09-29T12-00-00-{sid}.jsonl'
@@ -73,6 +76,12 @@ with tempfile.TemporaryDirectory() as tmp:
             with app.history_writer_lock(Path(env['CODEX_HOME']), sid): pass
         except app.Error: pass
         else: raise AssertionError('Native writer lock was not respected')
+        if expected == 1 and env['CODEX_HOME'] == str(app.account_home('a')):
+            try:
+                app.move(app.choose_session(sid), 'b')
+            except app.Error as exc:
+                assert 'Codex is using this conversation' in str(exc), str(exc)
+            else: raise AssertionError('Move accepted an unidentified active native writer')
         cursor = None
         serialized = ''
         count = 0
@@ -128,5 +137,28 @@ with tempfile.TemporaryDirectory() as tmp:
     pending.clear()
     try:
         initialize(); hydrate(2)
+        fork = rpc(80, 'thread/fork', {'threadId':sid, 'excludeTurns':True})['thread']['id']
+        nested = rpc(81, 'thread/fork', {'threadId':fork, 'excludeTurns':True})['thread']['id']
+        for check_id in (fork, nested):
+            inherited = rpc(82, 'thread/turns/list', {'threadId':check_id, 'limit':100, 'itemsView':'full'})
+            assert len(inherited['data']) == 2, ('source fork', check_id, inherited)
         print('PASS: paginated history resumes A -> B -> A, rebuilds stale indexes, preserves both turns, and respects native writer locks. No model request.')
+    finally: stop()
+
+    # Native forks use history_base references, not self-contained histories.
+    # Move to a fresh account with no ancestor files or database entries.
+    sid = nested
+    app.private_dir(app.account_home('c'))
+    auth = app.account_home('c') / 'auth.json'
+    auth.write_text('{}')
+    with contextlib.redirect_stdout(io.StringIO()): app.move(app.choose_session(sid), 'c')
+    auth.unlink()
+    env = app.environment('c')
+    proc = subprocess.Popen(['codex','app-server'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,env=env)
+    pending.clear()
+    try:
+        initialize()
+        hydrate(2)
+        print('PASS: native nested fork migrates to an empty account and preserves inherited turns. No model request.')
     finally: stop()

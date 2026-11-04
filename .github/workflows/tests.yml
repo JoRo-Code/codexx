@@ -26,6 +26,7 @@ jobs:
       - run: python test_continue.py
       - run: python test_overview.py
       - run: python test_router.py
+      - run: python test_resources.py
       - run: python test_onboarding.py
       - run: python test_setup_window.py
       - run: python test_refresh.py

@@ -73,7 +73,12 @@ with tempfile.TemporaryDirectory() as tmp:
         serialized = json.dumps(thread['turns'])
         assert 'Offline migration test.' in serialized, serialized
         assert 'Preserved response.' in serialized, serialized
-        print('PASS: real Codex discovers the moved session and reads its user/assistant history without a model request.')
+        rpc(3, 'thread/resume', {'threadId': sid, 'cwd': tmp})
+        try:
+            with app.history_writer_lock(app.account_home('b'), sid): pass
+        except app.Error: pass
+        else: raise AssertionError('Native legacy writer lock was not respected')
+        print('PASS: real Codex reads migrated legacy history and holds its native writer lock. No model request.')
     finally:
         proc.terminate()
         try:
