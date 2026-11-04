@@ -2,6 +2,7 @@
 from collections import deque
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import test_launcher as fixtures
@@ -123,5 +124,29 @@ class LiveUpdateTests(unittest.TestCase):
             app.record_update(policy='off',last_check=0)
             runtime.check_update()
             self.assertEqual(spawn.call_count,2)
+
+    def test_pending_reply_can_adopt_reader_without_restarting_backend(self):
+        runtime=self.runtime()
+        router=app.MultiRouter(factory=Backend)
+        router.runtime.close();router.runtime=runtime
+        self.addCleanup(router.close)
+        client=Client()
+        router.route(client,{'id':1,'method':'initialize','params':{}})
+        backend=app.Backend.__new__(app.Backend)
+        backend.buffer=bytearray(b'partial history')
+        backend.messages=deque()
+        backend.process=object()
+        bridge=SimpleNamespace(backend=backend,pending={'request':'thread/resume'},phase='idle')
+        lane=type('Lane',(),{})();lane.bridge=bridge
+        router.lanes.add(lane)
+        self.addCleanup(router.lanes.discard,lane)
+        original_process=backend.process
+        self.replace(runtime,extra='Backend.read = lambda self: "updated reader"')
+        router.route(client,{'id':2,'method':'thread/loaded/list','params':{}})
+        self.assertEqual(backend.read(),'updated reader')
+        self.assertEqual(backend.buffer,b'partial history')
+        self.assertEqual(bridge.pending,{'request':'thread/resume'})
+        self.assertIs(backend.process,original_process)
+
 
 if __name__=='__main__':unittest.main()

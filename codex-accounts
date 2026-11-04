@@ -1866,15 +1866,36 @@ class Backend:
         self.process.stdin.write((json.dumps(message)+'\n').encode())
         self.process.stdin.flush()
     def read(self):
-        data = os.read(self.process.stdout.fileno(), 65536)
-        if not data:
-            raise Error('Codex backend exited. Your saved conversation can be resumed.')
-        self.buffer.extend(data)
-        while b'\n' in self.buffer:
-            line, _, rest = self.buffer.partition(b'\n')
-            self.buffer[:] = rest
+        # Native JSON output can arrive in tiny writes. Drain a bounded burst
+        # instead of paying the actor's inbox wait for every fragment.
+        deadline = time.monotonic() + .01
+        received = 0
+        search_from = len(self.buffer)
+        while True:
+            data = os.read(self.process.stdout.fileno(), 65536)
+            if not data:
+                if received: break  # Deliver final complete messages before EOF.
+                raise Error('Codex backend exited. Your saved conversation can be resumed.')
+            self.buffer.extend(data)
+            received += len(data)
+            remaining = deadline - time.monotonic()
+            if received >= 1024 * 1024 or remaining <= 0: break
+            if not select.select([self.process.stdout], [], [], min(.001, remaining))[0]: break
+        consumed = 0
+        while True:
+            end = self.buffer.find(b'\n', search_from)
+            if end < 0: break
+            line = self.buffer[consumed:end]
+            consumed = search_from = end + 1
             if line.strip():
                 self.messages.append(json.loads(line))
+        if consumed: del self.buffer[:consumed]
+        # Older live actor loops wait on their inbox before every read. Wake
+        # that wait while a large reply still has bytes ready in the pipe.
+        inbox = getattr(self, 'router_inbox', None)
+        if inbox is not None and select.select([self.process.stdout], [], [], 0)[0]:
+            try: inbox.put_nowait(('backend_ready', None, None))
+            except queue.Full: pass
     def close(self):
         # This backend owns a dedicated process group. Stop its tools as well
         # as the server before handing history to the next account.
@@ -2399,7 +2420,11 @@ class RouterLane:
             self.ready.set_result(response)
             while not self.stopped.is_set():
                 try:
-                    kind, value, future = self.inbox.get(timeout=.02)
+                    delay = .02
+                    if self.bridge.backend.messages or select.select(
+                            [self.bridge.backend.process.stdout], [], [], 0)[0]:
+                        delay = 0
+                    kind, value, future = self.inbox.get(timeout=delay)
                 except queue.Empty:
                     kind = None
                 if kind == 'rpc':
@@ -2471,8 +2496,23 @@ class MultiRouter:
         return self.controls[name]
 
     def reply(self, client, message):
-        try: client.send(message)
-        except (OSError, EOFError): self.clients.discard(client)
+        transport = getattr(getattr(client, 'ws', None), 'sock', None)
+        try:
+            # Never wait for a socket reader while holding the routing mutex.
+            # Existing live clients acquire their writer lazily after an update.
+            if transport is not None:
+                RouterClient.enqueue(client, message)
+            else:
+                client.send(message)
+        except (OSError, EOFError):
+            self.clients.discard(client)
+            # sendall may already have written part of a JSON line/frame.
+            # Further replies would concatenate onto that truncated message.
+            # Shut down both directions to wake the reader and force reconnect;
+            # session backends remain owned by the router.
+            if transport is not None:
+                try: transport.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
 
     def notice(self, sid, text):
         # Standard error notification, scoped to the affected conversation.
@@ -2525,6 +2565,8 @@ class MultiRouter:
         with self.mutex:
             self.clients.discard(client)
             self.client_initializes.pop(client, None)
+            if getattr(getattr(client, 'ws', None), 'sock', None) is not None:
+                RouterClient.close(client)
             # Keep actors alive; replies to departed clients are dropped.
             for ident, pending in list(self.requests.items()):
                 if pending[0] is client:
@@ -2535,6 +2577,15 @@ class MultiRouter:
         with self.mutex:
             self.__class__ = module.MultiRouter
             if self.factory.__dict__.get('_live_native_backend', False): self.factory = module.Backend
+            # Reader upgrades only use existing buffer/messages/pipe state and
+            # are safe between reads, even while a large reply is incomplete.
+            # Waiting for bridge.pending to empty would strand that reply on
+            # the old reader. Executing calls retain their current function.
+            for lane in self.lanes:
+                backend = lane.bridge.backend if lane.bridge else None
+                if backend and backend.__class__.__dict__.get('_live_native_backend', False):
+                    backend.read = types.MethodType(module.Backend.read, backend)
+                    backend.router_inbox = getattr(lane, 'inbox', None)
         if self.closed: raise Error('Router is shutting down.')
         method, params = message.get('method'), message.get('params') or {}
         ident = message.get('id')
@@ -2644,6 +2695,9 @@ class MultiRouter:
         with self.mutex:
             self.closed = True
             lanes = list(self.lanes)
+            for client in list(self.clients):
+                if getattr(getattr(client, 'ws', None), 'sock', None) is not None:
+                    RouterClient.close(client)
             for lane in lanes: lane.stopped.set()
         for lane in lanes: lane.close()
         self.runtime.close()
@@ -2657,12 +2711,18 @@ class JsonSocket:
     def read(self):
         data=self.sock.recv(65536)
         if not data: raise EOFError
+        search_from = len(self.buffer)
         self.buffer.extend(data)
         if len(self.buffer)>64*1024*1024: raise Error('Oversized protocol message.')
         result=[]
-        while b'\n' in self.buffer:
-            line,_,rest=self.buffer.partition(b'\n');self.buffer[:]=rest
+        consumed = 0
+        while True:
+            end = self.buffer.find(b'\n', search_from)
+            if end < 0: break
+            line = self.buffer[consumed:end]
+            consumed = search_from = end + 1
             if line.strip(): result.append(json.loads(line))
+        if consumed: del self.buffer[:consumed]
         return result
 
 class RouterClient:
@@ -2670,6 +2730,52 @@ class RouterClient:
         self.ws, self.mutex = ws, threading.Lock()
     def send(self, message):
         with self.mutex: self.ws.send(message)
+
+    def enqueue(self, message):
+        if not hasattr(self, 'outbox'):
+            with self.mutex:
+                if not hasattr(self, 'outbox'):
+                    self.writer_stopped = threading.Event()
+                    # Native turns can emit hundreds of small notifications in
+                    # one burst before the writer gets a scheduling timeslice.
+                    self.outbox = queue.Queue(maxsize=1024)
+                    self.ws.sock.settimeout(45)
+                    self.writer = threading.Thread(target=RouterClient.write_replies,
+                                                   args=(self,), daemon=True)
+                    self.writer.start()
+        if self.writer_stopped.is_set(): raise EOFError
+        try: self.outbox.put_nowait(message)
+        except queue.Full:
+            RouterClient.close(self)
+            raise EOFError from None
+
+    def write_replies(self):
+        try:
+            while not self.writer_stopped.is_set():
+                try: message = self.outbox.get(timeout=.5)
+                except queue.Empty: continue
+                if self.writer_stopped.is_set(): break
+                self.send(message)
+                # A plugin/history reply can be tens of MB. Do not retain the
+                # last response while this client is idle waiting for another.
+                del message
+        except (OSError, EOFError, ValueError):
+            pass
+        finally:
+            RouterClient.close(self)
+
+    def close(self):
+        stopped = getattr(self, 'writer_stopped', None)
+        if stopped is not None: stopped.set()
+        # A timed-out send may have written a partial JSON line/frame. Shutdown
+        # wakes both the sender and the connection reader; never append to it.
+        try: self.ws.sock.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        outbox = getattr(self, 'outbox', None)
+        if outbox is not None:
+            while True:
+                try: outbox.get_nowait()
+                except queue.Empty: break
 
 def serve_router(address, preferred=None):
     path=Path(address).expanduser().resolve()
