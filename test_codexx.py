@@ -210,6 +210,22 @@ class InstallTests(unittest.TestCase):
 
 
 class FilterTests(unittest.TestCase):
+    def test_early_skills_notice_cannot_submit_an_op_before_thread_activation(self):
+        gate = cx.ChatFilter()
+        notice = {'method': 'skills/changed', 'params': {}}
+        self.assertFalse(gate.accepts(notice))
+        gate.from_client({'id': 1, 'method': 'thread/start', 'params': {}})
+        self.assertFalse(gate.accepts(notice))
+        # The normal startup catalog request still completes while starting.
+        gate.from_client({'id': 2, 'method': 'skills/list', 'params': {}})
+        self.assertTrue(gate.accepts({'id': 2, 'result': {'data': []}}))
+        self.assertTrue(gate.accepts({'id': 1, 'result': {'thread': {'id': 'mine'}}}))
+        self.assertTrue(gate.accepts(notice))
+        gate.from_client({'id': 3, 'method': 'thread/start', 'params': {}})
+        self.assertFalse(gate.accepts(notice))
+        gate.accepts({'id': 3, 'result': {'thread': {'id': 'next'}}})
+        self.assertTrue(gate.accepts(notice))
+
     def test_new_chat_uses_client_directory_not_router_service_directory(self):
         gate = cx.ChatFilter()
         gate.cwd = '/client/project'

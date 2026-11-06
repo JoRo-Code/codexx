@@ -20,7 +20,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.14.0'
+VERSION = '0.14.1'
 # Bump only when live object state/protocol can no longer be adopted in place.
 LIVE_RUNTIME_ABI = 2
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
@@ -3201,12 +3201,32 @@ class MultiRouter:
         self.lanes.add(lane)
         return lane
 
-    def control(self, account=None):
+    def control(self, account=None, initialize=None):
         name = account or self.primary or self.available()[0]
         if self.primary is None: self.primary = name
         old = self.controls.get(name)
-        if old is None or old.stopped.is_set():
-            self.controls[name] = self.lane(name, control=True)
+        upgrade = False
+        client = (initialize or {}).get('clientInfo') or {}
+        if old and old.ready.done() and not old.ready.exception() and client.get('name') == 'codex-tui':
+            version = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', client.get('version', ''))
+            server = re.search(r'/(\d+)\.(\d+)\.(\d+)(?:\s|$)', old.ready.result().get('userAgent', ''))
+            upgrade = bool(version and server and tuple(map(int, version.groups())) > tuple(map(int, server.groups())))
+        if old is None or old.stopped.is_set() or upgrade:
+            self.controls[name] = self.lane(name, control=True, initialize=initialize)
+            if upgrade:
+                # Metadata servers can outlive a CLI update. Replace only that
+                # server; each conversation retains its independent backend.
+                # Let outstanding metadata replies finish before retiring it.
+                def retire():
+                    deadline = time.monotonic() + 60
+                    while time.monotonic() < deadline and not old.stopped.is_set():
+                        with self.mutex:
+                            if (old.inbox.empty() and old.bridge and not old.bridge.pending
+                                    and not any(pending[2] is old for pending in self.requests.values())):
+                                old.stopped.set()
+                                return
+                        old.stopped.wait(.2)
+                threading.Thread(target=retire, daemon=True).start()
         return self.controls[name]
 
     def reply(self, client, message):
@@ -3308,7 +3328,7 @@ class MultiRouter:
                 if self.initialize is None: self.initialize = params
                 self.clients.add(client)
                 self.client_initializes[client] = params
-                lane = self.control()
+                lane = self.control(initialize=params)
             response = lane.ready.result(timeout=35)
             with self.mutex:
                 self.reply(client, {'id':ident,'result':response})

@@ -210,19 +210,19 @@ npm install -g @openai/codex@latest
 codex --version
 ```
 
-See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [official npm installation example](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex). Desktop users need the CLI too, because it runs the local backend. Codexx requires Codex's experimental `--remote unix://` and app-server interfaces; this release was locally checked with Codex 0.160.1.
+See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [official npm installation example](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex). Desktop users need the CLI too, because it runs the local backend. Codexx requires Codex's experimental `--remote unix://` and app-server interfaces; this release was locally checked with Codex 0.167.0.
 
 ### 2. Download and install Codexx
 
-For the published v0.13.2 release:
+For the published v0.14.1 release:
 
 ```sh
-git clone --branch v0.13.2 --depth 1 https://github.com/JoRo-Code/codexx.git
+git clone --branch v0.14.1 --depth 1 https://github.com/JoRo-Code/codexx.git
 cd codexx
 python3 install.py
 ```
 
-Alternatively, download `codexx-0.13.2.tar.gz` from [v0.13.2 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.13.2), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
+Alternatively, download `codexx-0.14.1.tar.gz` from [v0.14.1 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.14.1), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
 
 Already using `codex-accounts`? Run the same installer once. It retains accounts, history, settings and running services under `~/.local/share/codex-accounts`. You do not need to sign in again or restart existing chats. The old command remains supported. Already using a versioned Codexx installation? Use `codexx update` instead.
 
@@ -235,7 +235,7 @@ export PATH="$HOME/.local/bin:$PATH"
 codexx --bundle-version
 ```
 
-It should print `0.13.2` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
+It should print `0.14.1` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
 
 ### 4. Connect your accounts
 

@@ -167,6 +167,14 @@ class ChatFilter:
                     self.current = thread['id']
             return True
         params = message.get('params') or {}
+        if method == 'skills/changed' and (self.current is None or any(
+                request in ('thread/start', 'thread/resume', 'thread/fork')
+                for request in self.requests.values())):
+            # The router broadcasts skills changes from every backend, even
+            # before this TUI has attached its chat. Codex handles this notice
+            # through an active-thread operation, which fails during startup.
+            # Its explicit startup skills/list already reads the current catalog.
+            return False
         thread = params.get('thread') or {}
         sid = params.get('threadId') or params.get('thread_id') or params.get('conversationId') or thread.get('id')
         if method.startswith('codex/event/'):

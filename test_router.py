@@ -134,7 +134,9 @@ class Backend:
         method=message.get('method');p=message.get('params') or {}
         if 'id' not in message or not method:return
         result={}
-        if method in ('thread/start','thread/resume','thread/fork'):
+        if method == 'initialize':
+            result = {'userAgent': 'codex-tui/0.167.0 (test)'}
+        elif method in ('thread/start','thread/resume','thread/fork'):
             sid=p.get('threadId') if method=='thread/resume' else str(uuid.uuid4())
             result={'thread':{'id':sid,'ephemeral':p.get('ephemeral',False)}}
         elif method=='thread/list':
@@ -163,6 +165,41 @@ class RouterTests(unittest.TestCase):
         c.messages.clear();r.route(c,{'id':ident,'method':method,'params':params})
         wait_for(lambda:any(x.get('id')==ident for x in c.messages))
         return next(x for x in c.messages if x.get('id')==ident)
+    def test_new_cli_replaces_old_metadata_server_without_restarting_chat(self):
+        r,c=self.router()
+        self.request(r,c,'thread/resume',{'threadId':self.sid})
+        chat=r.sessions[self.sid]
+        backend=chat.bridge.backend
+        self.request(r,c,'turn/start',{'threadId':self.sid,'input':[]})
+        old=r.controls[r.primary]
+        old.ready=app.Future()
+        old.ready.set_result({'userAgent':'codex-tui/0.166.0 (test)'})
+        # A slow metadata request must receive its reply before retirement.
+        old.bridge.pending['"held-metadata"']='plugin/installed'
+        newer=Client()
+        options={'clientInfo':{'name':'codex-tui','version':'0.167.0'}}
+        r.route(newer,{'id':1,'method':'initialize','params':options})
+        replacement=r.controls[r.primary]
+        self.assertIsNot(replacement,old)
+        self.assertEqual(newer.messages[-1]['result']['userAgent'],'codex-tui/0.167.0 (test)')
+        self.assertFalse(old.stopped.is_set())
+        self.assertIs(r.sessions[self.sid],chat)
+        self.assertIs(chat.bridge.backend,backend)
+        self.assertFalse(backend.closed)
+        self.assertEqual(chat.bridge.phase,'starting turn')
+        old.bridge.pending.clear()
+        wait_for(old.stopped.is_set)
+        again=Client()
+        r.route(again,{'id':1,'method':'initialize','params':options})
+        self.assertIs(r.controls[r.primary],replacement)
+
+    def test_old_cli_does_not_replace_a_newer_metadata_server(self):
+        r,c=self.router()
+        control=r.controls[r.primary]
+        older=Client()
+        r.route(older,{'id':1,'method':'initialize','params':{
+            'clientInfo':{'name':'codex-tui','version':'0.166.0'}}})
+        self.assertIs(r.controls[r.primary],control)
     def test_two_chats_isolate_quota_failure_and_preserve_settings(self):
         r,c=self.router()
         self.request(r,c,'thread/resume',{'threadId':self.sid,'model':'chosen','sandbox':'danger-full-access','approvalPolicy':'never'})
