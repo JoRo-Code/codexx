@@ -22,6 +22,7 @@ class ResourceBackend(Backend):
         self.terminals = []
         self.queued = []
         self.goal = None
+        self.paths = {}
         self.fail_method = None
         self.probe_hook = None
         self.close_hook = None
@@ -45,6 +46,7 @@ class ResourceBackend(Backend):
         elif method == 'thread/read':
             sid = message['params']['threadId']
             response['result']['thread']['status'] = {'type':self.statuses.get(sid,'idle')}
+            if sid in self.paths: response['result']['thread']['path'] = self.paths[sid]
         elif method == 'thread/backgroundTerminals/list':
             response['result'] = {'data':self.terminals}
         elif method == 'thread/queue/list':
@@ -392,6 +394,196 @@ class ResourceTests(unittest.TestCase):
         self.assertIn('resident only',result['memoryMetric'])
         self.assertNotIn('Fix login page',json.dumps(result))
         self.assertNotIn('test_credentials',json.dumps(result))
+
+    def append_events(self, *kinds):
+        with self.path.open('a') as stream:
+            for kind in kinds:
+                stream.write(json.dumps({'type':'event_msg','payload':{'type':kind}})+'\n')
+
+    def stateful_lane(self, router, client, sid=None, pid=120):
+        lane = self.loaded(router, client, sid)
+        lane.bridge.backend.process.pid = pid
+        lane.volatile.add('stateful_tool')
+        self.ps.return_value.update({
+            pid:dict(parent=1,rss_kb=40000,name='codex',identity='server-%d' % pid),
+            pid+1:dict(parent=pid,rss_kb=60000,name='node_repl',identity='repl-%d' % pid)})
+        return lane
+
+    def expire_policy(self, **values):
+        app.atomic_json(app.ROOT/'resource-policy.json', dict(
+            {'enabled':True,'idle_seconds':600,'max_idle':6,'expire_seconds':7200,'max_loaded':12}, **values))
+
+    def test_stateful_runtime_expires_and_its_process_is_stopped(self):
+        router, client = self.router()
+        self.ps.return_value = {}
+        lane = self.stateful_lane(router, client)
+        self.assertIn('stateful_tool', lane.request_unload(True).result(5)['blockers'])
+        lane.volatile.discard('stateful_tool')
+        self.assertIn('stateful_runtime', lane.request_unload(True).result(5)['blockers'])
+        lane.volatile.add('stateful_tool')
+        # Pins, approvals and running tools still protect an expired runtime.
+        app.atomic_json(app.ROOT/'resource-preferences.json', {self.sid:{'pinned':True}})
+        self.assertIn('pinned', lane.request_unload(True, True).result(5)['blockers'])
+        app.atomic_json(app.ROOT/'resource-preferences.json', {})
+        lane.bridge.approvals.add('approval')
+        self.assertIn('approval_or_user_input', lane.request_unload(True, True).result(5)['blockers'])
+        lane.bridge.approvals.clear()
+        lane.bridge.backend.terminals = [{'processId':'p','osPid':999}]
+        self.assertIn('background_terminal', lane.request_unload(True, True).result(5)['blockers'])
+        lane.bridge.backend.terminals = []
+        with patch.object(app.os, 'kill') as kill:
+            self.assertEqual(lane.request_unload(True, True).result(5)['result'], 'unloaded')
+            kill.assert_called_once_with(121, app.signal.SIGTERM)
+        self.assertNotIn('stateful_tool', lane.volatile)
+        # History and resume survive; only the REPL state is lost.
+        self.assertNotIn('error', self.request(router, client, 'turn/start', {'threadId':self.sid,'input':[]}))
+        self.assertEqual(lane.state, 'loaded')
+
+    def test_maintenance_expires_stateful_lanes_only_after_threshold(self):
+        router, client = self.router()
+        self.ps.return_value = {}
+        lane = self.stateful_lane(router, client)
+        self.assertEqual(lane.request_unload(True).result(5)['result'], 'kept')
+        lane.last_check = 0
+        lane.last_activity = time.time()-3600
+        self.expire_policy()
+        router.maintain_resources(force=True)
+        time.sleep(.3)
+        self.assertEqual(lane.state, 'loaded')
+        lane.last_activity = time.time()-7300
+        with patch.object(app.os, 'kill'):
+            router.maintain_resources(force=True)
+            wait_for(lambda: lane.state == 'sleeping')
+        # A disabled expiry keeps stateful runtimes protected indefinitely.
+        other = self.stateful_lane(router, client, self.saved_chat(), pid=130)
+        other.request_unload(True).result(5)
+        other.last_check, other.last_activity = 0, time.time()-100000
+        self.expire_policy(expire_seconds=0, max_loaded=0)
+        router.maintain_resources(force=True)
+        time.sleep(.3)
+        self.assertEqual(other.state, 'loaded')
+
+    def test_stale_unfinished_items_and_working_phase_reconcile_with_rollout(self):
+        router, client = self.router()
+        lane = self.loaded(router, client)
+        lane.items.add((self.sid, 'lost-completion'))
+        lane.bridge.phase = 'working'
+        self.append_events('task_started')
+        blockers = lane.request_unload(True, True).result(5)['blockers']
+        self.assertIn('unfinished_items', blockers)
+        self.assertIn('phase:working', blockers)
+        self.append_events('task_complete', 'token_count')
+        # Saved history alone is not enough while the native thread is active.
+        lane.bridge.backend.statuses[self.sid] = 'active'
+        self.assertIn('thread_not_idle', lane.request_unload(True, True).result(5)['blockers'])
+        lane.bridge.backend.statuses[self.sid] = 'idle'
+        lane.bridge.phase = 'working'
+        self.assertIn('unfinished_items', lane.request_unload(True).result(5)['blockers'])
+        self.assertEqual(lane.request_unload(True, True).result(5)['result'], 'unloaded')
+        self.assertEqual(lane.items, set())
+        self.assertNotIn('error', self.request(router, client, 'turn/start', {'threadId':self.sid,'input':[]}))
+        # turn_aborted is also final.
+        lane.bridge.phase = 'working'
+        self.append_events('task_started', 'turn_aborted')
+        self.assertEqual(lane.request_unload(True, True).result(5)['result'], 'unloaded')
+
+    def test_rollout_reconciliation_reads_tail_and_fails_closed(self):
+        self.assertFalse(app.rollout_turn_finished(self.path))
+        self.append_events('task_complete')
+        with self.path.open('a') as stream:
+            stream.write(json.dumps({'type':'response_item','payload':{'text':'x'*5000}})+'\n')
+        self.assertTrue(app.rollout_turn_finished(self.path))
+        self.assertFalse(app.rollout_turn_finished(self.path, tail=1000))
+        self.append_events('task_started')
+        self.assertFalse(app.rollout_turn_finished(self.path))
+
+    def test_history_unavailable_retires_only_unmaterialized_threads_on_expiry(self):
+        router, client = self.router()
+        lane = self.loaded(router, client)
+        backend = lane.bridge.backend
+        self.path.unlink()
+        self.assertIn('history_unavailable', lane.request_unload(True).result(5)['blockers'])
+        # Without a native rollout path, fail closed.
+        self.assertIn('history_unavailable', lane.request_unload(True, True).result(5)['blockers'])
+        other = app.ROOT/'elsewhere.jsonl'
+        other.write_text('{}\n')
+        backend.paths[self.sid] = str(other)
+        self.assertIn('history_unavailable', lane.request_unload(True, True).result(5)['blockers'])
+        backend.paths[self.sid] = str(self.path)
+        lane.items.add((self.sid, 'item'))  # No saved turn can prove this stale.
+        self.assertIn('unfinished_items', lane.request_unload(True, True).result(5)['blockers'])
+        lane.items.clear()
+        self.assertEqual(lane.request_unload(False, True).result(5)['result'], 'would_retire')
+        self.assertEqual(lane.request_unload(True, True).result(5)['result'], 'retired')
+        wait_for(lambda: lane.stopped.is_set())
+        self.assertTrue(backend.closed)
+        self.assertNotIn(self.sid, router.sessions)
+        self.assertFalse((app.ROOT/'dormant'/(self.sid+'.json')).exists())
+
+    def test_secondary_and_superseded_control_servers_are_retired(self):
+        router, client = self.router()
+        self.expire_policy(control_idle_seconds=1800)
+        primary = router.controls[router.primary]
+        with router.mutex:
+            secondary = router.control('work')
+        secondary.ready.result(5)
+        self.assertIsNot(primary, secondary)
+        primary.last_used = secondary.last_used = time.time()-60
+        router.maintain_resources(force=True)
+        self.assertFalse(secondary.stopped.is_set())
+        secondary.last_used = time.time()-4000
+        secondary.bridge.pending['held'] = 'thread/list'
+        router.maintain_resources(force=True)
+        self.assertFalse(secondary.stopped.is_set())
+        secondary.bridge.pending.clear()
+        primary.last_used = time.time()-100000
+        router.maintain_resources(force=True)
+        wait_for(lambda: secondary.bridge.backend is None or secondary.bridge.backend.closed)
+        self.assertNotIn('work', router.controls)
+        self.assertFalse(primary.stopped.is_set())
+        # A later metadata request starts a fresh control server on demand.
+        with router.mutex:
+            again = router.control('work')
+        self.assertIsNot(again, secondary)
+        # A control server left behind by an upgrade never lingers.
+        with router.mutex:
+            router.controls['work'] = router.lane('work', control=True, initialize=router.initialize)
+        again.ready.result(5)
+        router.maintain_resources(force=True)
+        wait_for(lambda: again.stopped.is_set())
+        self.assertEqual(sum(lane.control and not lane.stopped.is_set() for lane in router.lanes), 2)
+
+    def test_loaded_cap_evicts_least_recently_used_safe_lanes(self):
+        router, client = self.router()
+        self.ps.return_value = {}
+        lanes = [self.stateful_lane(router, client, self.saved_chat(), pid=200+10*i) for i in range(4)]
+        for lane, age in zip(lanes, [5000, 4000, 300, 900]):
+            lane.request_unload(True).result(5)
+            lane.last_check, lane.last_activity = 0, time.time()-age
+        lanes[0].bridge.approvals.add('approval')  # Hard blockers are never evicted.
+        self.expire_policy(max_loaded=2)
+        with patch.object(app.os, 'kill'):
+            router.maintain_resources(force=True)
+            wait_for(lambda: lanes[1].state == 'sleeping' and lanes[3].state == 'sleeping')
+        self.assertEqual(lanes[0].state, 'loaded')
+        self.assertEqual(lanes[2].state, 'loaded')  # Too recently used to drop its REPL.
+
+    def test_status_reports_totals_and_memory_warning(self):
+        router, client = self.router()
+        self.ps.return_value = {}
+        self.stateful_lane(router, client)
+        self.expire_policy(rss_warning_mb=50, max_loaded=1)
+        result = self.request(router, client, 'codexx/status', {})['result']
+        self.assertEqual(result['totals']['chat_servers'], 1)
+        self.assertEqual(result['totals']['rss_kb'], 100000)
+        self.assertTrue(any('MB RSS' in w for w in result['totals']['warnings']))
+        totals = app.resource_totals([dict(state='loaded', control=False, rss_kb=10)]*3, app.resource_policy())
+        self.assertTrue(any('cap 1' in w for w in totals['warnings']))
+        with self.assertRaises(app.Error): app.main(['resources','policy','--max-loaded','-1'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.main(['resources','policy','--expire-seconds','3600','--max-loaded','8'])
+        self.assertEqual(app.resource_policy()['expire_seconds'], 3600)
+        self.assertEqual(app.resource_policy()['max_loaded'], 8)
 
     def test_resource_cli_validates_policy_and_does_not_start_routers(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:

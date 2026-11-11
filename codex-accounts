@@ -20,7 +20,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.14.1'
+VERSION = '0.14.2'
 # Bump only when live object state/protocol can no longer be adopted in place.
 LIVE_RUNTIME_ABI = 2
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
@@ -1709,6 +1709,10 @@ def parser():
     s.add_argument('--socket', help='Inspect one router, including a manually started router')
     s.add_argument('--idle-seconds', type=int)
     s.add_argument('--max-idle', type=int)
+    s.add_argument('--expire-seconds', type=int, help='Expire stale/stateful protection after this inactivity (0 disables)')
+    s.add_argument('--max-loaded', type=int, help='Cap on loaded chat servers per account data directory (0 disables)')
+    s.add_argument('--control-idle-seconds', type=int, help='Stop non-primary control servers after this inactivity (0 disables)')
+    s.add_argument('--rss-warning-mb', type=int, help='Warn in status above this total resident memory (0 disables)')
     s.add_argument('--off', action='store_true', help='Disable automatic unloading')
     s.add_argument('--on', action='store_true', help='Enable automatic unloading')
     s.add_argument('--pid', type=int, help='Owned background process to register or release')
@@ -2633,13 +2637,56 @@ def router_bridge_class(lane):
 
 Backend._live_native_backend = True
 
+# expire_seconds, max_loaded, control_idle_seconds and rss_warning_mb use 0 to disable.
+RESOURCE_POLICY_DEFAULTS = dict(enabled=True, idle_seconds=600, max_idle=6, expire_seconds=7200,
+                                max_loaded=12, control_idle_seconds=1800, rss_warning_mb=4096)
+RESOURCE_LIMITS = ('idle_seconds','max_idle','expire_seconds','max_loaded','control_idle_seconds','rss_warning_mb')
+STATEFUL_RUNTIMES = ('node_repl', 'ipython', 'ipykernel_launcher')
+# Router-side observations that can outlive their cause. They stop protecting a
+# server only after long inactivity (or cap pressure) and native revalidation.
+EXPIRABLE_BLOCKERS = ('stateful_tool','stateful_runtime','unfinished_items','phase:working','history_unavailable')
+HARD_BLOCKER_PREFIXES = ('phase:','pending_','approval','unfinished','pinned','stateful','realtime',
+                         'spawned','starting_backend')
+
 def resource_policy():
-    policy = dict(enabled=True, idle_seconds=600, max_idle=6)
+    policy = dict(RESOURCE_POLICY_DEFAULTS)
     policy.update(read_json(ROOT/'resource-policy.json', {}) or {})
     if type(policy['enabled']) is not bool or any(
-            type(policy[k]) is not int or policy[k] < 0 for k in ('idle_seconds','max_idle')):
+            type(policy[k]) is not int or policy[k] < 0 for k in RESOURCE_LIMITS):
         raise Error('Invalid resource policy.')
     return policy
+
+def rollout_turn_finished(path, tail=4*1024*1024):
+    """True only when the newest turn lifecycle event in saved history is final."""
+    with Path(path).open('rb') as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size-tail))
+        data = stream.read()
+    lines = data.split(b'\n')
+    if size > tail: lines = lines[1:]  # The first line may be truncated.
+    for line in reversed(lines):
+        if b'event_msg' not in line: continue
+        try: record = json.loads(line)
+        except ValueError: continue
+        if not isinstance(record, dict) or record.get('type') != 'event_msg': continue
+        payload = record.get('payload')
+        if not isinstance(payload, dict): continue
+        if payload.get('type') in ('task_complete', 'turn_aborted'): return True
+        if payload.get('type') == 'task_started': return False
+    return False
+
+def resource_totals(lanes, policy):
+    loaded = [lane for lane in lanes if lane.get('state') == 'loaded' and not lane.get('stopped')]
+    rss = sum(lane.get('rss_kb') or 0 for lane in loaded)
+    chats = sum(not lane.get('control') for lane in loaded)
+    warnings = []
+    if policy.get('rss_warning_mb') and rss > policy['rss_warning_mb']*1024:
+        warnings.append(f'Loaded servers use {rss/1024:.0f} MB RSS (warning above {policy["rss_warning_mb"]} MB).')
+    if policy.get('max_loaded') and chats > policy['max_loaded']:
+        warnings.append(f'{chats} chat servers are loaded (cap {policy["max_loaded"]}); protected work is kept.')
+    return dict(loaded=len(loaded), chat_servers=chats, control_servers=len(loaded)-chats,
+                rss_kb=rss, warnings=warnings)
 
 def resource_preferences(sid):
     return (read_json(ROOT/'resource-preferences.json', {}) or {}).get(sid, {})
@@ -2728,13 +2775,13 @@ def resource_router_addresses():
 def resource_command(args):
     operation = args.operation
     if args.apply and operation != 'prune': raise Error('--apply is only valid with prune.')
-    if operation != 'policy' and any((args.on, args.off, args.idle_seconds is not None, args.max_idle is not None)):
+    if operation != 'policy' and any((args.on, args.off, *(getattr(args, key) is not None for key in RESOURCE_LIMITS))):
         raise Error('Resource limits and --on/--off require the policy command.')
     if args.on and args.off: raise Error('Choose --on or --off.')
     if operation == 'policy':
         with lock('resource-policy'):
             policy = resource_policy()
-            for key in ('idle_seconds','max_idle'):
+            for key in RESOURCE_LIMITS:
                 value = getattr(args, key)
                 if value is not None:
                     if value < 0: raise Error('Resource limits must be nonnegative.')
@@ -2788,8 +2835,10 @@ def resource_command(args):
             reports.append(dict(socket=address, **status))
         except (OSError, Error, ValueError) as exc:
             reports.append(dict(socket=address, error=str(exc)))
+    policy = resource_policy()
+    totals = resource_totals([lane for report in reports for lane in report.get('lanes', [])], policy)
     if args.json:
-        print(json.dumps({'routers':reports,'policy':resource_policy()}, indent=2))
+        print(json.dumps({'routers':reports,'policy':policy,'totals':totals}, indent=2))
     else:
         if not reports: print('No running routers found.')
         for report in reports:
@@ -2800,9 +2849,14 @@ def resource_command(args):
                 if sid and lane.get('session') != sid: continue
                 rss = lane.get('rss_kb')
                 memory = f'{rss/1024:.0f} MB RSS' if rss is not None else 'RSS unavailable'
+                idle = f'idle {lane["idle_seconds"]/60:.0f} min' if lane.get('idle_seconds') is not None else ''
                 reason = ', '.join(lane.get('blockers', [])) or lane.get('result','eligible for safety check')
                 print('  '+str(lane.get('session') or '(control)')+'  '+lane.get('state','')+
-                      '  '+memory+'  '+reason)
+                      '  '+memory+'  '+idle+'  '+reason)
+        if operation == 'status' and not sid and any('lanes' in report for report in reports):
+            print(f'Total: {totals["chat_servers"]} chat and {totals["control_servers"]} control servers loaded, '
+                  f'{totals["rss_kb"]/1024:.0f} MB RSS')
+            for warning in totals['warnings']: print('Warning: '+warning)
         if operation == 'prune' and not args.apply: print('Preview only. Use --apply to unload sessions that pass all safety checks.')
         if operation == 'prune' and any(report.get('remaining',0) for report in reports):
             print('More servers remain; repeat prune for the next bounded batch.')
@@ -2835,7 +2889,7 @@ class RouterLane:
         self.generation = 0
         self.bridge = None
         self.state = 'starting'
-        self.last_activity = time.time()
+        self.last_activity = self.last_used = time.time()
         self.last_check = 0
         self.blockers = []
         self.items = set()
@@ -2876,19 +2930,22 @@ class RouterLane:
             options = self.setting_requests.pop(json.dumps(message['id']), None)
             if options and 'error' not in message: self.settings.update(options)
 
-    def blockers_now(self, persisted_tools=False):
+    def blockers_now(self, persisted_tools=False, expire=False):
+        """expire=True ignores stale router-side flags; check_idle revalidates them."""
         bridge = self.bridge
         if self.control: return ['control_server']
         if self.state == 'sleeping': return ['already_sleeping']
         if not bridge: return ['starting_backend']
         blockers = []
         safe_phases = ('idle','completed','interrupted','failed') if bridge.sid else ('starting','idle','completed','interrupted','failed')
-        if bridge.phase not in safe_phases: blockers.append('phase:'+bridge.phase)
+        if bridge.phase not in safe_phases and not (expire and bridge.phase == 'working'):
+            blockers.append('phase:'+bridge.phase)
         if bridge.pending or not self.inbox.empty(): blockers.append('pending_requests')
         if bridge.approvals: blockers.append('approval_or_user_input')
-        if self.items: blockers.append('unfinished_items')
+        if self.items and not expire: blockers.append('unfinished_items')
         if self.processes: blockers.append('spawned_process')
-        blockers.extend(sorted(self.volatile - ({'dynamic_tools'} if persisted_tools else set())))
+        ignored = ({'dynamic_tools'} if persisted_tools else set()) | ({'stateful_tool'} if expire else set())
+        blockers.extend(sorted(self.volatile - ignored))
         if bridge.backend and (bridge.backend.messages or getattr(bridge.backend,'buffer',b'')):
             blockers.append('pending_backend_messages')
         if bridge.sid and resource_preferences(bridge.sid).get('pinned'): blockers.append('pinned')
@@ -2910,11 +2967,18 @@ class RouterLane:
                     buffered_bytes=len(getattr(bridge.backend if bridge else None,'buffer',b'')),
                     queued_requests=self.inbox.qsize())
 
-    def check_idle(self):
-        """Runs only in the owning actor. A missing capability fails closed."""
-        blockers = self.blockers_now(persisted_tools=True)
+    def check_idle(self, expire=False):
+        """Runs only in the owning actor. A missing capability fails closed.
+
+        expire=True is used after long inactivity or under the loaded-server cap.
+        It accepts losing in-memory REPL state and reconciles stale unfinished
+        items/working phase against saved history; native checks still apply."""
+        self.empty_thread = False
+        blockers = self.blockers_now(persisted_tools=True, expire=expire)
         if blockers: return blockers
         bridge = self.bridge
+        activity = self.last_activity
+        stale = self.blockers_now(persisted_tools=True)
         try:
             # Failed starts/resumes can leave a fully initialized server without
             # a root session. An empty native inventory is required: ephemeral
@@ -2927,18 +2991,30 @@ class RouterLane:
                 pid = getattr(bridge.backend.process, 'pid', None)
                 if pid is not None:
                     if pid not in rows: return ['unknown_process_tree']
-                    if any(rows[p]['name'] in ('node_repl', 'ipython', 'ipykernel_launcher')
-                           for p in process_descendants(rows, pid) if p in rows):
+                    if not expire and any(rows[p]['name'] in STATEFUL_RUNTIMES
+                                          for p in process_descendants(rows, pid) if p in rows):
                         return ['stateful_runtime']
                 self.drain_backend()
                 if bridge.sid: return ['newly_loaded_thread']
-                return self.blockers_now(persisted_tools=True)
+                if self.last_activity != activity: return ['recent_activity']
+                return self.blockers_now(persisted_tools=True, expire=expire)
             try:
                 row = choose_session(bridge.sid)
             except Error:
-                return ['history_unavailable']
-            if 'dynamic_tools' in self.volatile and not persisted_dynamic_tools(row, bridge.sid):
+                # A thread that never started a turn has no rollout file, so
+                # there is nothing to lose. Only native confirmation that its
+                # rollout path is absent allows retiring it, and only on expiry.
+                if not expire: return ['history_unavailable']
+                path = bridge.rpc('thread/read', {'threadId':bridge.sid,'includeTurns':False}, timeout=3).get('thread',{}).get('path')
+                if not isinstance(path, str) or not path or Path(path).exists():
+                    return ['history_unavailable']
+                row = None
+            if row and 'dynamic_tools' in self.volatile and not persisted_dynamic_tools(row, bridge.sid):
                 return ['dynamic_tools_not_persisted']
+            if expire and ('unfinished_items' in stale or 'phase:working' in stale):
+                # Only saved history that ends its newest turn proves the flags stale.
+                if not row or not rollout_turn_finished(row['path']):
+                    return [b for b in stale if b in ('unfinished_items','phase:working')]
             rows = process_resources()
             registered = resource_preferences(bridge.sid).get('resources', [])
             disposable = {r['pid'] for r in registered if r['lifetime'] == 'session'
@@ -2965,8 +3041,7 @@ class RouterLane:
             if pid is not None:
                 if pid not in rows: return ['unknown_process_tree']
                 descendants = process_descendants(rows,pid)
-                if any(rows[p]['name'] in ('node_repl', 'ipython', 'ipykernel_launcher')
-                       for p in descendants if p in rows):
+                if not expire and any(rows[p]['name'] in STATEFUL_RUNTIMES for p in descendants if p in rows):
                     return ['stateful_runtime']
             for resource in resource_preferences(bridge.sid).get('resources', []):
                 current = rows.get(resource['pid'])
@@ -2974,7 +3049,9 @@ class RouterLane:
                     return ['persistent_'+resource['kind']]
             # Probe RPCs may deliver late notifications. Recheck before closing.
             self.drain_backend()
-            return self.blockers_now(persisted_tools=True)
+            if self.last_activity != activity: return ['recent_activity']
+            self.empty_thread = row is None
+            return self.blockers_now(persisted_tools=True, expire=expire)
         except (Error, OSError, ValueError, subprocess.SubprocessError):
             return ['safety_check_unavailable']
 
@@ -2985,30 +3062,56 @@ class RouterLane:
         while bridge.backend.messages:
             bridge.from_backend(bridge.backend.messages.popleft())
 
-    def unload(self, apply=False):
+    def stateful_runtimes(self):
+        """Runtime PIDs with their start identity, captured before an unload."""
+        pid = getattr(getattr(self.bridge.backend,'process',None),'pid',None)
+        try: rows = process_resources() if pid is not None else {}
+        except (OSError, ValueError, subprocess.SubprocessError): return {}
+        return {p:rows[p]['identity'] for p in process_descendants(rows,pid)
+                if p in rows and p != pid and rows[p]['name'] in STATEFUL_RUNTIMES}
+
+    def stop_runtimes(self, runtimes):
+        # A runtime that left the backend's process group would outlive it.
+        if not runtimes: return
+        try: rows = process_resources()
+        except (OSError, ValueError, subprocess.SubprocessError): return
+        for pid, identity in runtimes.items():
+            if rows.get(pid,{}).get('identity') == identity:
+                with contextlib.suppress(OSError): os.kill(pid, signal.SIGTERM)
+
+    def unload(self, apply=False, expire=False):
+        if isinstance(apply, dict):  # Keeps the actor inbox tuple shape stable.
+            apply, expire = apply.get('apply') is True, apply.get('expire') is True
         self.last_check = time.time()
-        self.blockers = self.check_idle()
+        self.blockers = self.check_idle(expire)
         if self.blockers: return dict(self.snapshot(), result='kept')
         bridge = self.bridge
-        if not bridge.sid:
+        if not bridge.sid or getattr(self, 'empty_thread', False):
             if not apply: return dict(self.snapshot(), result='would_retire')
+            runtimes = self.stateful_runtimes()
             # Serialize final retirement with routing. A queued request wins;
             # stale session aliases are removed before a new request can route.
             with self.router.mutex:
-                self.blockers = self.blockers_now(persisted_tools=True)
+                self.blockers = self.blockers_now(persisted_tools=True, expire=expire)
                 if self.blockers: return dict(self.snapshot(), result='kept')
                 self.state = 'retired'
                 self.stopped.set()
                 self.router.lane_failed(self, 'Empty conversation backend retired; retry the request.')
             bridge.close_backend()
+            self.stop_runtimes(runtimes)
             return dict(self.snapshot(), result='retired')
         if not apply: return dict(self.snapshot(), result='would_unload')
+        runtimes = self.stateful_runtimes()
         descriptor = dict(threadId=bridge.sid, initialize=bridge.initialize,
                           thread_options=bridge.thread_options, settings=self.settings)
         atomic_json(ROOT/'dormant'/(bridge.sid+'.json'), descriptor)
         self.state = 'unloading'
         preferences = resource_preferences(bridge.sid)
         bridge.close_backend()
+        self.stop_runtimes(runtimes)
+        # Saved history ended these turns; REPL state does not survive unloading.
+        self.items.clear()
+        self.volatile.discard('stateful_tool')
         if bridge.session_lock:
             bridge.session_lock.__exit__(None,None,None)
             bridge.session_lock = None
@@ -3058,12 +3161,12 @@ class RouterLane:
             self.state = 'sleeping'
             raise
 
-    def request_unload(self, apply=False):
+    def request_unload(self, apply=False, expire=False):
         result = Future()
         if self.stopped.is_set():
             result.set_result(dict(self.snapshot(), result='stopped'))
             return result
-        self.inbox.put_nowait(('unload', apply, result))
+        self.inbox.put_nowait(('unload', dict(apply=apply, expire=True) if expire else apply, result))
         return result
 
     def send(self, message):
@@ -3188,8 +3291,31 @@ class MultiRouter:
         except (OSError, ValueError, subprocess.SubprocessError): rows = None
         with self.mutex:
             lanes = [lane.snapshot(rows) for lane in self.lanes if not lane.stopped.is_set()]
-        return dict(resourceManagement=True, lanes=lanes, policy=resource_policy(),
+        policy = resource_policy()
+        return dict(resourceManagement=True, lanes=lanes, policy=policy, totals=resource_totals(lanes, policy),
                     memoryMetric='rss_kb (resident only; excludes compressed and swapped memory)')
+
+    def retire_controls(self, policy, now):
+        """Keep at most one control server per account and stop idle secondary ones.
+
+        Control servers serve history/metadata only and restart on demand. The
+        primary account's server carries Desktop account state and stays."""
+        limit = policy.get('control_idle_seconds', 0)
+        with self.mutex:
+            current = {id(lane) for lane in self.controls.values()}
+            for lane in list(self.lanes):
+                if not lane.control or lane.stopped.is_set() or not lane.ready.done(): continue
+                superseded = id(lane) not in current
+                if not superseded and (lane is self.controls.get(self.primary) or not limit
+                                       or now-getattr(lane, 'last_used', lane.last_activity) < limit):
+                    continue
+                if (not lane.inbox.empty() or (lane.bridge and (lane.bridge.pending or lane.bridge.approvals))
+                        or any(pending[2] is lane for pending in self.requests.values())
+                        or any(approval[0] is lane for approval in self.approvals.values())):
+                    continue
+                for name, owner in list(self.controls.items()):
+                    if owner is lane: del self.controls[name]
+                lane.stopped.set()
 
     def maintain_resources(self, address=None, force=False):
         now = time.time()
@@ -3201,28 +3327,46 @@ class MultiRouter:
         atomic_json(ROOT/'resource-routers'/(self.resource_identity+'.json'), record)
         policy = status['policy']
         if not policy['enabled']: return
-        candidates = []
+        self.retire_controls(policy, now)
+        loaded, candidates = 0, []
         for router in resource_router_records():
             for row in router['lanes']:
-                if row['state'] != 'loaded' or row['control']: continue
+                if row['state'] != 'loaded' or row['control'] or row.get('stopped'): continue
+                loaded += 1
                 # The owning actor will revalidate these candidates. A previous
                 # failed probe is retried at most once per minute.
                 if now-row.get('last_check',0) < 60: continue
-                if any(b.startswith(('phase:','pending_','approval','unfinished','pinned',
-                                     'stateful','realtime','spawned','starting_backend')) for b in row['blockers']): continue
-                candidates.append(row)
+                soft = [b for b in row['blockers'] if b in EXPIRABLE_BLOCKERS]
+                if any(b.startswith(HARD_BLOCKER_PREFIXES) for b in row['blockers'] if b not in soft): continue
+                candidates.append(dict(row, expire=bool(soft), age=now-row['last_activity']))
         candidates.sort(key=lambda row: row['last_activity'])
-        over = max(0, len(candidates)-policy['max_idle'])
-        selected = {(r['session'], r['pid']) for i,r in enumerate(candidates)
-                    if i < over or now-r['last_activity'] >= policy['idle_seconds']}
+        plain = [r for r in candidates if not r['expire']]
+        over = max(0, len(plain)-policy['max_idle'])
+        selected = {(r['session'], r['pid']):False for i,r in enumerate(plain)
+                    if i < over or r['age'] >= policy['idle_seconds']}
+        # Stale or stateful protection expires after long inactivity.
+        expire_after = policy.get('expire_seconds', 0)
+        for r in candidates:
+            if r['expire'] and expire_after and r['age'] >= expire_after:
+                selected[(r['session'], r['pid'])] = True
+        # Hard cap: evict least recently used servers that pass the safety
+        # checks, accepting REPL loss after at least ten minutes of inactivity.
+        excess = loaded-len(selected)-policy.get('max_loaded', 0) if policy.get('max_loaded') else 0
+        for r in candidates:
+            if excess <= 0: break
+            key = (r['session'], r['pid'])
+            if key not in selected and r['age'] >= max(policy['idle_seconds'], 600 if r['expire'] else 0):
+                selected[key] = True
+                excess -= 1
         with self.mutex:
             eligible = sorted(self.lanes, key=lambda lane: lane.last_activity)
             count = 0
             for lane in eligible:
-                if (lane.bridge and (lane.bridge.sid, getattr(getattr(lane.bridge.backend,'process',None),'pid',None)) in selected and not lane.maintenance_pending
+                key = (lane.bridge.sid, getattr(getattr(lane.bridge.backend,'process',None),'pid',None)) if lane.bridge else None
+                if (key in selected and not lane.maintenance_pending
                         and lane.state == 'loaded' and not lane.stopped.is_set()):
                     lane.maintenance_pending = True
-                    try: lane.request_unload(True)
+                    try: lane.request_unload(True, selected[key])
                     except queue.Full: lane.maintenance_pending = False
                     count += 1
                     if count == 2: break
@@ -3270,6 +3414,7 @@ class MultiRouter:
             version = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', client.get('version', ''))
             server = re.search(r'/(\d+)\.(\d+)\.(\d+)(?:\s|$)', old.ready.result().get('userAgent', ''))
             upgrade = bool(version and server and tuple(map(int, version.groups())) > tuple(map(int, server.groups())))
+        if old is not None: old.last_used = time.time()
         if old is None or old.stopped.is_set() or upgrade:
             self.controls[name] = self.lane(name, control=True, initialize=initialize)
             if upgrade:
@@ -3634,6 +3779,7 @@ def _serve_router(address, preferred=None):
             try: sock,_=listener.accept()
             except socket.timeout: continue
             thread=threading.Thread(target=connected,args=(sock,),daemon=True)
+            clients[:]=[t for t in clients if t.is_alive()]
             clients.append(thread);thread.start()
     finally:
         stopping.set();listener.close();router.close();path.unlink(missing_ok=True)

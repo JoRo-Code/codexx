@@ -210,19 +210,19 @@ npm install -g @openai/codex@latest
 codex --version
 ```
 
-See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [official npm installation example](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex). Desktop users need the CLI too, because it runs the local backend. Codexx requires Codex's experimental `--remote unix://` and app-server interfaces; this release was locally checked with Codex 0.167.0.
+See [OpenAI's CLI documentation](https://learn.chatgpt.com/docs/codex/cli) and [official npm installation example](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex). Desktop users need the CLI too, because it runs the local backend. Codexx requires Codex's experimental `--remote unix://` and app-server interfaces; this release was locally checked with Codex 0.167.1.
 
 ### 2. Download and install Codexx
 
-For the published v0.14.1 release:
+For the published v0.14.2 release:
 
 ```sh
-git clone --branch v0.14.1 --depth 1 https://github.com/JoRo-Code/codexx.git
+git clone --branch v0.14.2 --depth 1 https://github.com/JoRo-Code/codexx.git
 cd codexx
 python3 install.py
 ```
 
-Alternatively, download `codexx-0.14.1.tar.gz` from [v0.14.1 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.14.1), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
+Alternatively, download `codexx-0.14.2.tar.gz` from [v0.14.2 Releases](https://github.com/JoRo-Code/codexx/releases/tag/v0.14.2), extract it, open Terminal in the extracted folder, and run `python3 install.py`. Downloads do not require a GitHub account. The installer prints the installed bundle and entry points.
 
 Already using `codex-accounts`? Run the same installer once. It retains accounts, history, settings and running services under `~/.local/share/codex-accounts`. You do not need to sign in again or restart existing chats. The old command remains supported. Already using a versioned Codexx installation? Use `codexx update` instead.
 
@@ -235,7 +235,7 @@ export PATH="$HOME/.local/bin:$PATH"
 codexx --bundle-version
 ```
 
-It should print `0.14.1` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
+It should print `0.14.2` (or a later installed release). To retain the PATH setting in new terminals, add the export line once to `~/.zshrc` for zsh (the macOS default), or `~/.bashrc` for Bash. The installer deliberately leaves your shell configuration alone.
 
 ### 4. Connect your accounts
 
@@ -560,9 +560,35 @@ The persistent local protocol router gives each loaded root chat a separate Code
 Automatic resource management defaults to **10 minutes of inactivity** and **six
 idle chat servers across routers sharing the same account data directory**.
 The oldest eligible servers unload first. Control servers and protected sessions
-are outside this idle cache budget; this is not a hard limit on active work.
-Each maintenance pass schedules at most two checks. Failed safety checks retry
-at most once a minute.
+are outside this idle cache budget. Each maintenance pass schedules at most two
+checks. Failed safety checks retry at most once a minute.
+
+So that a long-running router cannot accumulate servers without bound:
+
+- **Expiry (default 2 hours, `--expire-seconds`).** After this much inactivity,
+  stale or stateful protection lapses. A Node REPL/Python runtime is stopped
+  together with its server (in-memory variables are lost; chat history and
+  resume are kept). Unfinished-item and `working` flags count as stale only if
+  the saved history's newest turn ended in `task_complete` or `turn_aborted`.
+  A chat whose history is unavailable is retired only when the native server
+  reports a rollout path that does not exist: such a thread never started a turn,
+  so nothing is lost. A thread with an existing but unindexed history file stays
+  protected and keeps reporting `history_unavailable`.
+- **Loaded cap (default 12 chat servers, `--max-loaded`).** Above the cap, the
+  least recently used servers that pass the safety checks unload first, including
+  stateful runtimes idle for at least 10 minutes (or `--idle-seconds`, if larger).
+- **Control servers.** There is at most one per account. Secondary accounts'
+  servers stop after 30 minutes without history/metadata use
+  (`--control-idle-seconds`) and restart on demand. A server replaced by a CLI
+  upgrade stops as soon as it has no pending requests. The primary account's
+  server stays.
+- `resources status` shows the total loaded servers and resident memory, with
+  a warning above 4096 MB (`--rss-warning-mb`) or above the cap.
+
+Expiry never overrides active turns, pending requests, approvals or user input,
+native threads that are not idle, background terminals, queued work, continuing
+goals, persistent registered resources, ephemeral/untracked threads or pins. A
+value of 0 disables expiry, the cap, control expiry or the memory warning.
 
     codexx resources                         # Server state, resident memory and blockers
     codexx resources status --json
@@ -571,6 +597,8 @@ at most once a minute.
     codexx resources pin SESSION_ID          # Keep a session's runtime alive
     codexx resources unpin SESSION_ID
     codexx resources policy --idle-seconds 600 --max-idle 6
+    codexx resources policy --expire-seconds 7200 --max-loaded 12
+    codexx resources policy --control-idle-seconds 1800 --rss-warning-mb 4096
     codexx resources policy --off            # Keep diagnostics and manual prune
     codexx resources policy --on
 
@@ -578,7 +606,7 @@ Every unload is serialized with incoming requests in the chat's worker. The
 worker verifies saved history, all loaded thread statuses (including subagents),
 background terminals, queued submissions and continuing goals. Outstanding
 requests, approvals, unfinished tools, ephemeral threads, realtime sessions and
-known stateful runtimes such as Node REPL prevent unloading. Unknown or unsupported
+known stateful runtimes such as Node REPL prevent unloading until they expire. Unknown or unsupported
 native diagnostics keep the server alive and report a blocker. Dynamic tool
 schemas alone do not retain a server: unloading requires valid definitions in
 that exact saved thread's metadata, which native resume restores. Missing or
@@ -598,7 +626,7 @@ Browsing saved history does not wake the chat server. The descriptor also surviv
 a router restart. Reloading an inactive server can add latency to the next request.
 
 Chat history does **not** restore in-memory REPL variables. Pin a runtime you need
-to preserve. Background resources can also be registered explicitly:
+to preserve beyond the expiry. Background resources can also be registered explicitly:
 
     codexx resources register SESSION_ID --pid 12345 --kind preview --lifetime persistent
     codexx resources register SESSION_ID --pid 12346 --kind terminal --lifetime session
