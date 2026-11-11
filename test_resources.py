@@ -181,6 +181,87 @@ class ResourceTests(unittest.TestCase):
             setattr(backend,field,None if field == 'goal' else [])
         self.assertEqual(lane.request_unload(True).result(5)['result'],'unloaded')
 
+    def test_persisted_dynamic_tools_restore_and_missing_definitions_stay_loaded(self):
+        router, client = self.router()
+        lane = self.loaded(router, client)
+        lane.volatile.add('dynamic_tools')  # Includes lanes from older live code.
+        self.assertIn('dynamic_tools_not_persisted', lane.request_unload(True).result(5)['blockers'])
+        lines = self.path.read_text().splitlines()
+        meta = json.loads(lines[0])
+        tool = {'type':'namespace','name':'functions','description':'fixture','tools':[
+            {'type':'function','name':'fixture','description':'fixture','inputSchema':{'type':'object'}}]}
+        meta['payload']['dynamic_tools'] = [tool]
+        lines[0] = json.dumps(meta)
+        self.path.write_text('\n'.join(lines)+'\n')
+        original = self.path.read_bytes()
+        self.assertEqual(lane.request_unload(True).result(5)['result'], 'unloaded')
+        self.request(router, client, 'thread/resume', {'threadId':self.sid})
+        self.assertEqual(self.path.read_bytes(), original)
+        options = next(m['params'] for m in lane.bridge.backend.sent if m.get('method') == 'thread/resume')
+        self.assertNotIn('dynamicTools', options)  # Not a native resume parameter.
+        lane.volatile.add('stateful_tool')
+        self.assertIn('stateful_tool', lane.request_unload(True).result(5)['blockers'])
+
+    def test_dynamic_metadata_malformed_shapes_fail_closed(self):
+        for record in [[], None, {'payload':[]}, {'payload':{'id':self.sid,'dynamic_tools':[None]}}]:
+            self.path.write_text(json.dumps(record)+'\n')
+            self.assertFalse(app.persisted_dynamic_tools({'path':str(self.path)}, self.sid))
+
+    def test_empty_failed_start_is_retired_but_loaded_ephemeral_is_protected(self):
+        router, client = self.router()
+        lane = router.lane(router.primary, initialize=router.initialize)
+        lane.ready.result(5)
+        wait_for(lambda: lane.state == 'loaded')
+        backend = lane.bridge.backend
+        lane.volatile.add('dynamic_tools')  # A rejected start created no thread.
+        self.assertIsNone(lane.bridge.sid)
+        self.assertEqual(lane.request_unload().result(5)['result'], 'would_retire')
+        backend.ids.add('ephemeral')
+        self.assertIn('untracked_loaded_threads', lane.request_unload(True).result(5)['blockers'])
+        self.assertFalse(backend.closed)
+        backend.ids.clear()
+        self.assertEqual(lane.request_unload(True).result(5)['result'], 'retired')
+        wait_for(lambda: lane.stopped.is_set())
+        self.assertTrue(backend.closed)
+
+    def test_empty_lane_unknown_probe_pending_and_racing_request_are_protected(self):
+        router, client = self.router()
+        lane = router.lane(router.primary, initialize=router.initialize)
+        lane.ready.result(5)
+        wait_for(lambda: lane.state == 'loaded')
+        backend = lane.bridge.backend
+        backend.fail_method = 'thread/loaded/list'
+        self.assertIn('safety_check_unavailable', lane.request_unload(True).result(5)['blockers'])
+        backend.fail_method = None
+        lane.bridge.pending['held'] = 'thread/start'
+        self.assertIn('pending_requests', lane.request_unload(True).result(5)['blockers'])
+        lane.bridge.pending.clear()
+        entered, release = threading.Event(), threading.Event()
+        backend.probe_hook = lambda: (entered.set(), release.wait(3))
+        pending = lane.request_unload(True)
+        self.assertTrue(entered.wait(3))
+        lane.submit({'id':'new-start','method':'thread/start','params':{}})
+        release.set()
+        self.assertEqual(pending.result(5)['result'], 'kept')
+        wait_for(lambda: lane.bridge.sid is not None)
+        self.assertFalse(backend.closed)
+
+    def test_automatic_maintenance_retires_empty_lanes_individually(self):
+        router, client = self.router()
+        old = router.lane(router.primary, initialize=router.initialize)
+        new = router.lane(router.primary, initialize=router.initialize)
+        for index, lane in enumerate([old, new]):
+            lane.ready.result(5)
+            wait_for(lambda: lane.state == 'loaded')
+            lane.bridge.backend.process.pid = 500 + index
+        self.ps.return_value = {500:dict(parent=1,rss_kb=1,name='codex',identity='a'),
+                                501:dict(parent=1,rss_kb=1,name='codex',identity='b')}
+        old.last_activity = time.time()-1000
+        app.atomic_json(app.ROOT/'resource-policy.json', {'enabled':True,'max_idle':6,'idle_seconds':600})
+        router.maintain_resources(force=True)
+        wait_for(lambda: old.stopped.is_set())
+        self.assertFalse(new.stopped.is_set())
+
     def test_unknown_capability_and_unsaved_history_never_unload(self):
         router, client = self.router()
         lane = self.loaded(router,client)
@@ -188,7 +269,7 @@ class ResourceTests(unittest.TestCase):
         self.assertIn('safety_check_unavailable',lane.request_unload(True).result(5)['blockers'])
         lane.bridge.backend.fail_method = None
         self.path.unlink()
-        self.assertIn('safety_check_unavailable',lane.request_unload(True).result(5)['blockers'])
+        self.assertIn('history_unavailable',lane.request_unload(True).result(5)['blockers'])
         self.assertFalse(lane.bridge.backend.closed)
 
     def test_pin_and_persistent_resources_use_process_birth_identity(self):

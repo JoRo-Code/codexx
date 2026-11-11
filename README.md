@@ -579,7 +579,13 @@ worker verifies saved history, all loaded thread statuses (including subagents),
 background terminals, queued submissions and continuing goals. Outstanding
 requests, approvals, unfinished tools, ephemeral threads, realtime sessions and
 known stateful runtimes such as Node REPL prevent unloading. Unknown or unsupported
-native diagnostics keep the server alive and report a blocker. A sleeping OS
+native diagnostics keep the server alive and report a blocker. Dynamic tool
+schemas alone do not retain a server: unloading requires valid definitions in
+that exact saved thread's metadata, which native resume restores. Missing or
+invalid definitions remain protected, as do running tools and stateful runtimes.
+Failed starts/resumes with no root thread can retire only after the native loaded
+thread inventory is empty and all pending-work checks pass. Ephemeral or untracked
+loaded threads remain protected. A sleeping OS
 process alone is never considered proof that its chat can be unloaded.
 
 Unloading stops the owned backend and its process group and releases writer
@@ -616,6 +622,7 @@ updates remain supported after that transition.
 Lifecycle regression checks:
 
     python3 test_resources.py
+    python3 test_native_dynamic_resources.py # Native dynamic-tool restore; localhost fixture only
     python3 test_native_router.py --resources   # Real backends; no model requests
 
 Start the router in a private, short-path directory:

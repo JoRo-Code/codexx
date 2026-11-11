@@ -2808,6 +2808,24 @@ def resource_command(args):
             print('More servers remain; repeat prune for the next bounded batch.')
     return 1 if any(r.get('error') for r in reports) else 0
 
+def persisted_dynamic_tools(row, sid):
+    """Native resume restores definitions from session metadata, not resume params."""
+    with Path(row['path']).open() as stream:
+        record = json.loads(stream.readline(1024 * 1024))
+    if not isinstance(record, dict): return False
+    payload = record.get('payload')
+    if not isinstance(payload, dict): return False
+    def valid(tool):
+        if not isinstance(tool, dict) or not isinstance(tool.get('name'), str) or not tool['name']:
+            return False
+        if tool.get('type') == 'namespace':
+            nested = tool.get('tools')
+            return isinstance(nested, list) and bool(nested) and all(valid(t) for t in nested)
+        return tool.get('type') == 'function' and isinstance(tool.get('inputSchema'), dict)
+    definitions = payload.get('dynamic_tools')
+    return (record.get('type') == 'session_meta' and payload.get('id') == sid
+            and isinstance(definitions, list) and bool(definitions) and all(valid(t) for t in definitions))
+
 class RouterLane:
     def __init__(self, router, account, initialize, control=False, resume_descriptor=None):
         self.router, self.control = router, control
@@ -2841,6 +2859,8 @@ class RouterLane:
             if 'node_repl' in tool or 'python' in tool:
                 self.volatile.add('stateful_tool')
         elif method == 'item/completed': self.items.discard(key)
+        elif method == 'thread/started' and (params.get('thread') or {}).get('ephemeral'):
+            self.volatile.add('ephemeral_thread')
         elif method == 'process/exited': self.processes.discard(params.get('processId'))
         elif method == 'thread/realtime/started': self.volatile.add('realtime')
         elif method == 'thread/realtime/closed': self.volatile.discard('realtime')
@@ -2856,21 +2876,22 @@ class RouterLane:
             options = self.setting_requests.pop(json.dumps(message['id']), None)
             if options and 'error' not in message: self.settings.update(options)
 
-    def blockers_now(self):
+    def blockers_now(self, persisted_tools=False):
         bridge = self.bridge
         if self.control: return ['control_server']
         if self.state == 'sleeping': return ['already_sleeping']
-        if not bridge or not bridge.sid: return ['unsaved_session']
+        if not bridge: return ['starting_backend']
         blockers = []
-        if bridge.phase not in ('idle','completed','interrupted','failed'): blockers.append('phase:'+bridge.phase)
+        safe_phases = ('idle','completed','interrupted','failed') if bridge.sid else ('starting','idle','completed','interrupted','failed')
+        if bridge.phase not in safe_phases: blockers.append('phase:'+bridge.phase)
         if bridge.pending or not self.inbox.empty(): blockers.append('pending_requests')
         if bridge.approvals: blockers.append('approval_or_user_input')
         if self.items: blockers.append('unfinished_items')
         if self.processes: blockers.append('spawned_process')
-        blockers.extend(sorted(self.volatile))
+        blockers.extend(sorted(self.volatile - ({'dynamic_tools'} if persisted_tools else set())))
         if bridge.backend and (bridge.backend.messages or getattr(bridge.backend,'buffer',b'')):
             blockers.append('pending_backend_messages')
-        if resource_preferences(bridge.sid).get('pinned'): blockers.append('pinned')
+        if bridge.sid and resource_preferences(bridge.sid).get('pinned'): blockers.append('pinned')
         return blockers
 
     def snapshot(self, rows=None):
@@ -2891,11 +2912,33 @@ class RouterLane:
 
     def check_idle(self):
         """Runs only in the owning actor. A missing capability fails closed."""
-        blockers = self.blockers_now()
+        blockers = self.blockers_now(persisted_tools=True)
         if blockers: return blockers
         bridge = self.bridge
         try:
-            choose_session(bridge.sid)
+            # Failed starts/resumes can leave a fully initialized server without
+            # a root session. An empty native inventory is required: ephemeral
+            # or otherwise untracked threads must never be inferred inactive.
+            if not bridge.sid:
+                loaded = bridge.rpc('thread/loaded/list', {}, timeout=3)
+                if loaded.get('data') != [] or loaded.get('nextCursor'):
+                    return ['untracked_loaded_threads']
+                rows = process_resources()
+                pid = getattr(bridge.backend.process, 'pid', None)
+                if pid is not None:
+                    if pid not in rows: return ['unknown_process_tree']
+                    if any(rows[p]['name'] in ('node_repl', 'ipython', 'ipykernel_launcher')
+                           for p in process_descendants(rows, pid) if p in rows):
+                        return ['stateful_runtime']
+                self.drain_backend()
+                if bridge.sid: return ['newly_loaded_thread']
+                return self.blockers_now(persisted_tools=True)
+            try:
+                row = choose_session(bridge.sid)
+            except Error:
+                return ['history_unavailable']
+            if 'dynamic_tools' in self.volatile and not persisted_dynamic_tools(row, bridge.sid):
+                return ['dynamic_tools_not_persisted']
             rows = process_resources()
             registered = resource_preferences(bridge.sid).get('resources', [])
             disposable = {r['pid'] for r in registered if r['lifetime'] == 'session'
@@ -2930,20 +2973,36 @@ class RouterLane:
                 if current and current['identity'] == resource['identity'] and resource['lifetime'] == 'persistent':
                     return ['persistent_'+resource['kind']]
             # Probe RPCs may deliver late notifications. Recheck before closing.
-            if select.select([bridge.backend.process.stdout],[],[],0)[0]:
-                bridge.backend.read()
-            while bridge.backend.messages:
-                bridge.from_backend(bridge.backend.messages.popleft())
-            return self.blockers_now()
+            self.drain_backend()
+            return self.blockers_now(persisted_tools=True)
         except (Error, OSError, ValueError, subprocess.SubprocessError):
             return ['safety_check_unavailable']
+
+    def drain_backend(self):
+        bridge = self.bridge
+        if select.select([bridge.backend.process.stdout],[],[],0)[0]:
+            bridge.backend.read()
+        while bridge.backend.messages:
+            bridge.from_backend(bridge.backend.messages.popleft())
 
     def unload(self, apply=False):
         self.last_check = time.time()
         self.blockers = self.check_idle()
         if self.blockers: return dict(self.snapshot(), result='kept')
-        if not apply: return dict(self.snapshot(), result='would_unload')
         bridge = self.bridge
+        if not bridge.sid:
+            if not apply: return dict(self.snapshot(), result='would_retire')
+            # Serialize final retirement with routing. A queued request wins;
+            # stale session aliases are removed before a new request can route.
+            with self.router.mutex:
+                self.blockers = self.blockers_now(persisted_tools=True)
+                if self.blockers: return dict(self.snapshot(), result='kept')
+                self.state = 'retired'
+                self.stopped.set()
+                self.router.lane_failed(self, 'Empty conversation backend retired; retry the request.')
+            bridge.close_backend()
+            return dict(self.snapshot(), result='retired')
+        if not apply: return dict(self.snapshot(), result='would_unload')
         descriptor = dict(threadId=bridge.sid, initialize=bridge.initialize,
                           thread_options=bridge.thread_options, settings=self.settings)
         atomic_json(ROOT/'dormant'/(bridge.sid+'.json'), descriptor)
@@ -3150,17 +3209,17 @@ class MultiRouter:
                 # failed probe is retried at most once per minute.
                 if now-row.get('last_check',0) < 60: continue
                 if any(b.startswith(('phase:','pending_','approval','unfinished','pinned',
-                                     'stateful','realtime','spawned','unsaved')) for b in row['blockers']): continue
+                                     'stateful','realtime','spawned','starting_backend')) for b in row['blockers']): continue
                 candidates.append(row)
         candidates.sort(key=lambda row: row['last_activity'])
         over = max(0, len(candidates)-policy['max_idle'])
-        selected = {r['session'] for i,r in enumerate(candidates)
+        selected = {(r['session'], r['pid']) for i,r in enumerate(candidates)
                     if i < over or now-r['last_activity'] >= policy['idle_seconds']}
         with self.mutex:
             eligible = sorted(self.lanes, key=lambda lane: lane.last_activity)
             count = 0
             for lane in eligible:
-                if (lane.bridge and lane.bridge.sid in selected and not lane.maintenance_pending
+                if (lane.bridge and (lane.bridge.sid, getattr(getattr(lane.bridge.backend,'process',None),'pid',None)) in selected and not lane.maintenance_pending
                         and lane.state == 'loaded' and not lane.stopped.is_set()):
                     lane.maintenance_pending = True
                     try: lane.request_unload(True)
