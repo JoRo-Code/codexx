@@ -53,6 +53,36 @@ class AuthFailoverTests(unittest.TestCase):
                                  'authenticationFailed')
                 self.assertIsNone(app.account_failure({'codexErrorInfo': {kind: {'httpStatusCode': 500}}}))
 
+    def test_revoked_refresh_token_is_classified_as_permanent(self):
+        revoked = {'message': 'Your access token could not be refreshed because your refresh token was revoked. '
+                              'Please log out and sign in again.', 'codexErrorInfo': 'unauthorized'}
+        self.assertEqual(app.account_failure(revoked), 'authenticationRevoked')
+        self.assertEqual(app.account_failure({'message': 'expired', 'codexErrorInfo': 'unauthorized'}),
+                         'authenticationFailed')
+        # Message text alone (e.g. tool output) never rotates.
+        self.assertIsNone(app.account_failure({'message': revoked['message']}))
+
+    def test_revoked_account_stays_excluded_until_login_rewrites_auth(self):
+        bridge = self.make_bridge()
+        revoked = self.auth_completion()
+        revoked['params']['turn']['error'] = {'codexErrorInfo': 'unauthorized',
+            'message': 'Your access token could not be refreshed because your refresh token was revoked.'}
+        with patch.object(bridge, 'rpc', side_effect=self.fake_rpc):
+            bridge.from_backend(revoked)
+        self.assertEqual(bridge.name, 'work')
+        self.assertEqual(app.choose_session(self.sid)['account'], 'work')
+        state = app.read_json(app.ROOT / 'routing.json')['personal']
+        self.assertEqual(state['reason'], 'authenticationRevoked')
+        # Cooldown expiry does not make a revoked login eligible again.
+        with app.routing_state() as rows: rows['personal']['retry_after'] = 0
+        self.assertNotIn('personal', app.eligible_accounts())
+        # Signing in again writes a new auth.json and clears the exclusion.
+        auth = app.account_home('personal') / 'auth.json'
+        auth.write_text(auth.read_text())
+        import os
+        st = auth.stat(); os.utime(auth, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        self.assertIn('personal', app.eligible_accounts())
+
     def test_tool_errors_and_retrying_errors_do_not_rotate(self):
         bridge = self.make_bridge()
         with patch.object(bridge, 'failover') as failover:

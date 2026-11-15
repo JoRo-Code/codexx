@@ -20,7 +20,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.14.2'
+VERSION = '0.14.3'
 # Bump only when live object state/protocol can no longer be adopted in place.
 LIVE_RUNTIME_ABI = 2
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
@@ -1394,7 +1394,9 @@ def render_status(reports):
         print(f'\n{report["label"]} · {clean_text(email)} · {clean_text(plan)}')
         print(f'  Identity: {clean_text(identity_status)} · {len(report["runs"])} launcher session(s) open')
         cooldown = report['routing'].get('retry_after', 0)
-        if cooldown > time.time():
+        if auth_revoked(report['label'], report['routing']):
+            print('  Sign-in revoked: skipped by automatic routing until codex-accounts login ' + report['label'])
+        elif cooldown > time.time():
             print('  Routing cooldown: retry eligible in ' + duration(cooldown - time.time()))
         if report.get('usage_error'):
             print('  Limits unavailable: ' + clean_text(report['usage_error']))
@@ -1462,6 +1464,7 @@ def list_accounts():
         remaining = max(0, int(routing.get('retry_after', 0) - time.time()))
         cooldown = f' · retry eligible in {remaining // 60}m {remaining % 60}s' if remaining else ''
         email, plan, status = identities[name]
+        if auth_revoked(name, routing): status, cooldown = 'sign-in revoked', ' · skipped until login'
         print(f"{name:<20} {email:<{email_width}}  {plan:<{plan_width}}  {status:<22} {count}{cooldown}")
     print('Email and plan are from cached Codex identity; quota and token validity are not checked.')
     print('Live limits and session locations: codex-accounts status --watch')
@@ -1877,18 +1880,35 @@ import struct
 from collections import deque
 
 QUOTA_ERRORS = {'usageLimitExceeded', 'rateLimitExceeded'}
+# authenticationRevoked: the saved login can never recover by itself (refresh
+# token revoked, seat removed). It stays out of routing until auth.json changes.
+AUTH_FAILURES = {'authenticationFailed', 'authenticationRevoked'}
+REVOKED_AUTH_MESSAGES = ('refresh token was revoked', 'token_revoked', 'invalidated oauth token',
+                         'refresh token has expired', 'refresh token was already used', 'log out and sign in again')
+
+def auth_revoked_stamp(name):
+    try: return (account_home(name) / 'auth.json').stat().st_mtime_ns
+    except OSError: return None
+
+def auth_revoked(name, row):
+    stamp = row.get('auth_revoked')
+    return stamp is not None and stamp == auth_revoked_stamp(name)
 
 def account_failure(error):
     """Classify terminal model-service errors, never tool output or item text."""
     if not isinstance(error, dict): return None
     info = error.get('codexErrorInfo')
     if isinstance(info, str) and info in QUOTA_ERRORS: return info
+    message = str(error.get('message') or '').lower()
+    # Only Codex's own auth classifications rotate; the message decides whether
+    # the login is permanently dead or may recover after a cooldown.
+    auth = 'authenticationRevoked' if any(text in message for text in REVOKED_AUTH_MESSAGES) else 'authenticationFailed'
+    if info == 'unauthorized': return auth
     if isinstance(info, dict):
         for kind in ('httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected'):
             detail = info.get(kind)
             if isinstance(detail, dict) and detail.get('httpStatusCode') == 401:
-                return 'authenticationFailed'
-    message = str(error.get('message') or '').lower()
+                return auth
     # Workspace discovery currently reports an unstructured error. Keep the
     # fallback narrow so a tool's unrelated authorization error cannot rotate.
     if ('workspace routing discovery' in message and
@@ -2023,7 +2043,8 @@ def eligible_accounts(exclude=()):
     with routing_state() as state:
         names = [name for name in accounts() if name not in exclude
                  and (require_account(name) / 'auth.json').is_file()
-                 and state.get(name, {}).get('retry_after', 0) <= time.time()]
+                 and state.get(name, {}).get('retry_after', 0) <= time.time()
+                 and not auth_revoked(name, state.get(name, {}))]
         usage = {name: {'rateLimits': state.get(name, {}).get('quota', {})} for name in names}
         names = [name for name in names if not any(
             type(w.get('usedPercent')) in (int, float) and w['usedPercent'] >= 100
@@ -2077,6 +2098,7 @@ def mark_quota_failure(name, error, snapshot=None):
         row = state.setdefault(name, {})
         row['retry_after'] = max(resets) if resets else time.time() + delay
         row['reason'] = error
+        if error == 'authenticationRevoked': row['auth_revoked'] = auth_revoked_stamp(name)
 
 class Backend:
     def __init__(self, name):
@@ -2384,7 +2406,7 @@ class AutoBridge:
         # history, so no tools or history writers survive on the source account.
         self.reconnect_account(target)
         self.tried.add(target)
-        reason = 'authentication was rejected' if info == 'authenticationFailed' else 'usage limit was reached'
+        reason = 'authentication was rejected' if info in AUTH_FAILURES else 'usage limit was reached'
         continuation = ('Continue the unfinished request from the preceding turn. The account\'s ' + reason + ' '
                         'and the launcher reconnected this conversation using another account. Inspect the saved history '
                         'and current state, preserve completed work, and do not repeat completed side effects.')
@@ -2628,10 +2650,10 @@ def router_bridge_class(lane):
                 self.update_marker()
                 lane.router.notice(self.sid, 'Account switch failed: '+str(exc))
             if self.phase == 'failed':
-                self.phase = 'waiting for authentication' if info == 'authenticationFailed' else 'waiting for quota'
+                self.phase = 'waiting for authentication' if info in AUTH_FAILURES else 'waiting for quota'
                 self.update_marker()
                 lane.router.notice(self.sid, 'No other account is ready. Reconnect an account with codexx accounts login <name> and resume.'
-                                   if info == 'authenticationFailed' else
+                                   if info in AUTH_FAILURES else
                                    'No other account is ready. Resume after an account reset or add another account.')
     return Bridge
 
